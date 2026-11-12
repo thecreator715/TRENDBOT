@@ -351,7 +351,7 @@ async function manageTp(px) {
 // ---------- strategy context / allocation ----------
 const mkCtx = () => S.ctxFrom(candles.closed, S.aggregate(candles.closed, candles.cur, cfg.htfMult || 4), { tradesToday: P.tradesToday || 0 });
 const useFrac = () => Math.min(1, Math.max(0.05, (P.use ?? 100) / 100));
-let walC = null, walAt = 0, walTxC = [], walTxAt = 0, balC = null, balAt = 0, offC = [], offAt = 0, xuC = null, xuAt = 0;
+let prevB = null, walC = null, walAt = 0, walTxC = [], walTxAt = 0, balC = null, balAt = 0, offC = [], offAt = 0, xuC = null, xuAt = 0;
 const amtOf = x => (typeof x === 'string' ? { cur: 'XRP', v: Number(x) / 1e6, iss: null } : { cur: x.currency, v: Number(x.value), iss: x.issuer });
 const isAsset = (x, a) => (isXRP(a) ? x.cur === 'XRP' : x.cur === a.currency && x.iss === a.issuer);
 async function refreshOffers(force) {
@@ -384,6 +384,13 @@ async function tick() {
     if (wallet && !MOCK && Date.now() - walTxAt > 20000) { walTxAt = Date.now(); walletTx().then(t => { walTxC = t; }).catch(() => {}); }
     const e = equityOf(b, px);
     if (startEq == null) startEq = e;
+    // external deposit/withdrawal (not a trade): shift the day's baseline by the flow so it is not read as a trading gain or loss
+    if (wallet && prevB && !prevB.busy && !(P.pos || P.pend) && prevB.tr === state.trades.length && prevB.pid === pair.id) {
+      const flow = (b.quote - prevB.b.quote) + (b.base - prevB.b.base) * px;
+      if (Math.abs(flow) > Math.max(cfg.minTradeQuote, 0.01 * Math.max(e, 1e-9))) { startEq += flow; if (startEq < 0) startEq = 0; addLog('info', `Deposit/withdrawal detected: ${flow >= 0 ? '+' : ''}${flow.toFixed(4)} ${sym(pair.quote.currency)}. Baseline adjusted, P/L unchanged.`); }
+    }
+    prevB = { b: { ...b }, busy: !!(P.pos || P.pend), tr: state.trades.length, pid: pair.id };
+    if (walC) { const tot = a => isXRP(a) ? walC.xrp : ((walC.lines.find(x => x.raw === a.currency && x.issuer === a.issuer) || {}).balance || 0); last.eqAll = tot(pair.quote) + tot(pair.base) * px; last.xrpTotal = walC.xrp; }
     const dk = new Date().toISOString().slice(0, 10);
     if (dk !== dayKey) { dayKey = dk; startEq = e; P.tradesToday = 0; P.dayPnl = 0; P.goalHit = false; if (state.halted && /daily goal/.test(state.halted)) state.halted = null; }
     eq.push(e); if (eq.length > 600) eq.shift();
@@ -398,6 +405,7 @@ async function tick() {
       const ls = Math.max(c2.low * (1 - bf), c2.high * (1 - mx)), ss2 = Math.min(c2.high * (1 + bf), c2.low * (1 + mx));
       return { long: { trigger: c2.high, stop: ls, target: c2.high + (c2.high - ls) * R }, short: { trigger: c2.low, stop: ss2, target: c2.low - (ss2 - c2.low) * R }, shortsOn: !!state.shortOn }; })();
     if (P.goal > 0 && !P.goalHit && startEq && tradePnlPct >= P.goal) { P.goalHit = true; state.halted = `daily goal +${P.goal}% reached`; addLog('buy', 'DAILY GOAL reached: flattening, resumes tomorrow'); }
+    if (state.halted && /^daily loss/.test(state.halted) && -tradePnlPct < cfg.dailyLossHaltPct) { addLog('info', `Daily-loss halt cleared: loss is now ${(-tradePnlPct).toFixed(2)}% (under ${cfg.dailyLossHaltPct}%)`); state.halted = null; }
     const halt = fs.existsSync(F('STOP')) ? 'STOP file present' : state.halted;
     if (P.pos && !(P.pos.base > 1e-9)) { addLog('info', 'cleared empty position record'); P.pos = null; }
     if (P.pend) await handlePend(px, halt);
@@ -455,7 +463,7 @@ const view = () => {
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
-    use: P.use ?? 100, goal: P.goal || 0, goalHit: !!P.goalHit, trades: state.trades.filter(t => !t.pair || t.pair === pair.id).slice(-300), marks: (P.marks || []).slice(-120), eq, start: startEq, logs, cfg: { ...S.DEFAULTS, ...cfg }, consec: P.consec, bal: balC, wal: walC ? { ...walC, at: walAt } : null, wtx: walTxC, noTrust: last.noTrust || null, eqNow: last.eq ?? null, note: last.note || null,
+    use: P.use ?? 100, goal: P.goal || 0, goalHit: !!P.goalHit, trades: state.trades.filter(t => !t.pair || t.pair === pair.id).slice(-300), marks: (P.marks || []).slice(-120), eq, start: startEq, logs, cfg: { ...S.DEFAULTS, ...cfg }, consec: P.consec, bal: balC, eqAll: last.eqAll ?? null, wal: walC ? { ...walC, at: walAt } : null, wtx: walTxC, noTrust: last.noTrust || null, eqNow: last.eq ?? null, note: last.note || null,
   };
 };
 const body = req => new Promise((res, rej) => { let d = ''; req.on('data', c => { d += c; if (d.length > 20000) { rej(new Error('too large')); req.destroy(); } }); req.on('end', () => { try { res(d ? JSON.parse(d) : {}); } catch (e) { rej(e); } }); });
