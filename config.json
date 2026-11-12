@@ -19,5 +19,16 @@
   "cooldownCandles": 1,
   "minTradeQuote": 0.01,
   "uiPort": 8787,
-  "shortInventoryPct": 50
+  "shortInventoryPct": 50,
+  "entryMode": "limit",
+  "limitSpreadFrac": 0.3,
+  "limitTimeoutSec": 40,
+  "limitChasePct": 0.25,
+  "limitFallback": true,
+  "tpLimit": true,
+  "slPct": 0,
+  "tpPct": 0,
+  "autoShort": true,
+  "flipReverse": true,
+  "limitRepriceSec": 4
 }

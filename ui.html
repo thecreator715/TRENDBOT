@@ -273,6 +273,8 @@ body.chartonly .colB,body.chartonly .colC{display:none!important}body.chartonly 
   <table class="tr"><thead><tr><th>SIDE</th><th>PRICE</th><th>AMOUNT</th><th>VALUE</th><th></th></tr></thead><tbody id="ordTbl"><tr><td colspan="5" class="k">—</td></tr></tbody></table>
   <h2 style="margin-top:12px"><span>Place limit order</span><span class="k">rests on the XRPL book</span></h2>
   <div class="ctrl"><select id="lmSide"><option value="buy">Buy</option><option value="sell">Sell</option></select><input type="number" id="lmPx" placeholder="price" step="any" style="width:90px"><input type="number" id="lmAmt" placeholder="amount (base)" step="any" style="width:110px"><button class="primary" id="lmGo">Place</button></div>
+  <h2 style="margin-top:12px"><span>Automatic orders</span><span class="k">bot places & manages these itself</span></h2><div id="autoOrd"></div>
+  <div class="note" id="autoPlan"></div>
   <div class="note">Limit orders are real OfferCreate transactions on mainnet. They can fill partially, stay open until cancelled, and cost a reserve while open. The bot's own entries/exits use market-style IOC orders and are separate from these.</div>
 </div>
 <div class="pane" data-p="tools">
@@ -1122,10 +1124,20 @@ function drawDD(){const cv=$('ddMini');if(!cv)return;const[x,W,H]=setup(cv);x.cl
   let pk=0;const dd=d.map(v=>{pk=Math.max(pk,v);return(pk-v)/pk*100}),mx=Math.max(...dd,.2),X=i=>i/(d.length-1)*W,Y=v=>6+v/mx*(H-14);
   x.beginPath();x.moveTo(0,6);dd.forEach((v,i)=>x.lineTo(X(i),Y(v)));x.lineTo(W,6);x.closePath();x.fillStyle=lg(x,6,H,[[0,'rgba(255,93,115,.05)'],[1,'rgba(255,93,115,.5)']]);x.fill();x.strokeStyle='#ff5d73';x.lineWidth=1.3;x.stroke();
   x.fillStyle='#8fb0e0';x.font='10px JetBrains Mono';x.fillText('0%',4,16);x.fillText('−'+mx.toFixed(2)+'%',4,H-6);$('ddInfo').textContent='now −'+dd[dd.length-1].toFixed(2)+'% · max −'+mx.toFixed(2)+'%'}
-function ordersUI(){const live=MODE==='live';$('ordPair').textContent=S.pair||'—';
+function autoOrdUI(){const el=$('autoOrd');if(!el||el.dataset.b||MODE!=='live')return;el.dataset.b=1;
+  const R=[['limitSpreadFrac','Start at (0 = bid, 1 = ask)',0,1,.05,''],['limitTimeoutSec','Give up / fall back after',10,180,5,'s'],['limitChasePct','Cancel if price runs away',.05,1.5,.05,'%'],['slPct','Auto stop-loss (0 = structure)',0,5,.1,'%'],['tpPct','Auto take-profit (0 = R-multiple)',0,10,.1,'%']];
+  const T=[['limitFallback','Market fallback on timeout'],['tpLimit','Take-profit rests on the book'],['flipReverse','Flip long⇄short instantly']];
+  el.innerHTML='<div class="slider"><label>Entry orders</label><select id="aoMode" style="width:100%"><option value="limit">Automatic limit (rests on book, walks to market)</option><option value="market">Market (immediate-or-cancel)</option></select></div>'
+   +R.map(([k,l,a,b,st,uu])=>`<div class="slider"><label>${l}<b id="ao_${k}">${cfg[k]??0}${uu}</b></label><input type="range" min="${a}" max="${b}" step="${st}" value="${cfg[k]??0}" data-ao="${k}" data-u="${uu}"></div>`).join('')
+   +'<div class="ctrl" style="flex-wrap:wrap">'+T.map(([k,l])=>`<button class="chip ${cfg[k]?'on':''}" data-aot="${k}">${l}</button>`).join('')+'</div>';
+  $('aoMode').value=cfg.entryMode||'limit';$('aoMode').onchange=e=>act('config',{entryMode:e.target.value});
+  el.querySelectorAll('[data-ao]').forEach(i=>{i.oninput=()=>$('ao_'+i.dataset.ao).textContent=i.value+i.dataset.u;i.onchange=()=>act('config',{[i.dataset.ao]:+i.value})});
+  el.querySelectorAll('[data-aot]').forEach(b=>b.onclick=()=>act('config',{[b.dataset.aot]:!cfg[b.dataset.aot]}).then(()=>b.classList.toggle('on',!!cfg[b.dataset.aot])))}
+function ordersUI(){autoOrdUI();
+  {const pl=S.plan,el=$('autoPlan');if(el)el.innerHTML=MODE==='live'&&pl?`<b>Auto plan</b> (updates every candle) · ${S.pend?'<span class="pos">limit entry resting ('+S.pend.age+'s)</span> · ':''}${S.autoOn?'auto ON':'auto OFF'} · shorts ${pl.shortsOn?'ON':'OFF'}<br>LONG on break above <b>${fp(pl.long.trigger)}</b> · stop ${fp(pl.long.stop)} · target ${fp(pl.long.target)}<br>SHORT on break below <b>${fp(pl.short.trigger)}</b> · stop ${fp(pl.short.stop)} · target ${fp(pl.short.target)}`:''}const live=MODE==='live';$('ordPair').textContent=S.pair||'—';
   $('ordNote').textContent=live?(S.live?'Open offers of the connected wallet on this pair (refreshes every few seconds).':'Connect a wallet on the Wallet page to see and place orders.'):'Simulator: real orders exist only in Live mode.';
   const o=live&&S.offers?S.offers:[];const act_=document.activeElement&&document.activeElement.closest&&document.activeElement.closest('#ordTbl');if(act_)return;
-  $('ordTbl').innerHTML=o.map(x=>`<tr><td class="${x.side==='BUY'?'pos':'neg'}">${x.side}</td><td>${fp(x.price)}</td><td>${(+x.base).toLocaleString(undefined,{maximumFractionDigits:4})} ${S.baseSym}</td><td>${(+x.quote).toLocaleString(undefined,{maximumFractionDigits:4})} ${S.quoteSym}</td><td><button class="sm" data-oc="${x.seq}">cancel</button></td></tr>`).join('')||'<tr><td colspan="5" class="k">no open orders on this pair</td></tr>';
+  $('ordTbl').innerHTML=o.map(x=>`<tr><td class="${x.side==='BUY'?'pos':'neg'}">${x.side}</td><td>${fp(x.price)}</td><td>${(+x.base).toLocaleString(undefined,{maximumFractionDigits:4})} ${S.baseSym}</td><td>${(+x.quote).toLocaleString(undefined,{maximumFractionDigits:4})} ${S.quoteSym}</td><td>${x.bot?'<span class="k">bot · '+x.bot+'</span> ':''}<button class="sm" data-oc="${x.seq}">cancel</button></td></tr>`).join('')||'<tr><td colspan="5" class="k">no open orders on this pair</td></tr>';
   $('ordTbl').querySelectorAll('[data-oc]').forEach(b=>b.onclick=()=>act('cancel',{seq:+b.dataset.oc}).then(r=>r&&toast('Order cancelled',true)));
   if($('lmPx')&&!$('lmPx').value&&S.px)$('lmPx').placeholder='price ~'+fp(S.px)}
 function paneRender(){

@@ -36,7 +36,7 @@ const pairById = id => pairs.find(p => p.id === id);
 // ---------- state ----------
 let wallet = null, client = null, busy = false;
 let state = (() => { try { return JSON.parse(fs.readFileSync(F('state.json'), 'utf8')); } catch { return {}; } })();
-state.pairId ||= 'XRP/RLUSD'; state.autoOn ??= true; state.shortOn ??= false; state.pairs ||= {}; state.trades ||= [];
+state.pairId ||= 'XRP/RLUSD'; state.autoOn ??= true; state.shortOn ??= !!cfg.autoShort; state.pairs ||= {}; state.trades ||= [];
 let pair = pairById(state.pairId) || pairs[0];
 let P, candles; // per-pair runtime
 const logs = []; const eq = []; let startEq = null, dayKey = null;
@@ -209,6 +209,7 @@ async function openShort(px, stop, target, qtyBase, why) {
 }
 async function closePos(px, reason, slip, frac = 1) {
   const pos = P.pos, short = pos.side === 'SHORT';
+  if (pos.tp) { await cancelOffer(pos.tp.seq); pos.tp = null; }
   let r;
   if (short) { // buy back the base we sold
     const b = await balances();
@@ -220,16 +221,118 @@ async function closePos(px, reason, slip, frac = 1) {
     r = await swap('SELL', qty, px, slip);
   }
   if (!r.filled) { addLog('info', `exit not filled (${r.code}); retrying next tick`); return false; }
-  const portion = Math.min(1, r.base / pos.base);
-  const pnl = short ? pos.cost * portion - r.quote : r.quote - pos.cost * portion;
-  P.dayPnl = (P.dayPnl || 0) + pnl;
-  pos.cost -= pos.cost * portion; pos.base -= r.base;
-  state.trades.push({ t: Date.now(), pair: pair.id, side: short ? 'SHORT' : 'LONG', entry: pos.entry, exit: r.price, pnl: +pnl.toFixed(6), r: pos.risk ? +(pnl / (pos.risk * portion)).toFixed(3) : null, reason, bars: pos.t0 ? Math.max(0, Math.round((Date.now() - pos.t0) / candles.tf)) : 0 }); if (state.trades.length > 500) state.trades.shift();
-  (P.marks ||= []).push({ t: candles.cur.t, price: r.price, kind: short ? 'cover' : 'sell' });
-  logTrade([new Date().toISOString(), pair.id, short ? 'COVER' : 'SELL', wallet ? 'live' : 'paper', reason, r.base.toFixed(6), r.quote.toFixed(6), r.price.toPrecision(8), pnl.toFixed(6)]);
-  addLog(pnl < 0 ? 'loss' : 'sell', `${short ? 'COVER' : 'SELL'} ${r.base.toFixed(2)} @ ${r.price.toPrecision(6)} · ${reason} · ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} ${sym(pair.quote.currency)}`);
-  if (pos.base < 1e-6 || pos.base * px < Math.max(1e-6, cfg.minTradeQuote * 0.1) || (short && portion > 0.98)) { P.consec = pnl < 0 ? P.consec + 1 : 0; P.cooldownUntil = (candles.cur?.t || Date.now()) + cfg.cooldownCandles * cfg.timeframeMinutes * 60_000; P.pos = null; }
+  recordExit(r.base, r.quote, r.price, reason);
   return true;
+}
+
+function recordExit(rBase, rQuote, rPrice, reason) {
+  const pos = P.pos, short = pos.side === 'SHORT';
+  const portion = Math.min(1, rBase / pos.base);
+  const pnl = short ? pos.cost * portion - rQuote : rQuote - pos.cost * portion;
+  P.dayPnl = (P.dayPnl || 0) + pnl;
+  pos.cost -= pos.cost * portion; pos.base -= rBase;
+  state.trades.push({ t: Date.now(), pair: pair.id, side: short ? 'SHORT' : 'LONG', entry: pos.entry, exit: rPrice, pnl: +pnl.toFixed(6), r: pos.risk ? +(pnl / (pos.risk * portion)).toFixed(3) : null, reason, bars: pos.t0 ? Math.max(0, Math.round((Date.now() - pos.t0) / candles.tf)) : 0 }); if (state.trades.length > 500) state.trades.shift();
+  (P.marks ||= []).push({ t: candles.cur.t, price: rPrice, kind: short ? 'cover' : 'sell' });
+  logTrade([new Date().toISOString(), pair.id, short ? 'COVER' : 'SELL', wallet ? 'live' : 'paper', reason, rBase.toFixed(6), rQuote.toFixed(6), rPrice.toPrecision(8), pnl.toFixed(6)]);
+  addLog(pnl < 0 ? 'loss' : 'sell', `${short ? 'COVER' : 'SELL'} ${rBase.toFixed(2)} @ ${rPrice.toPrecision(6)} · ${reason} · ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} ${sym(pair.quote.currency)}`);
+  if (pos.base < 1e-6 || pos.base * rPrice < Math.max(1e-6, cfg.minTradeQuote * 0.1) || (short && portion > 0.98)) { P.consec = pnl < 0 ? P.consec + 1 : 0; P.cooldownUntil = reason === 'trend-flip' && cfg.flipReverse ? 0 : (candles.cur?.t || Date.now()) + cfg.cooldownCandles * cfg.timeframeMinutes * 60_000; P.pos = null; }
+}
+
+// ---------- automatic limit orders: entries rest on the book, take-profit rests on the book, stops are polled ----------
+async function placeLimit(side, baseAmt, price) {
+  const qa = baseAmt * price;
+  const gets = side === 'BUY' ? amount(pair.quote, qa) : amount(pair.base, baseAmt), pays = side === 'BUY' ? amount(pair.base, baseAmt) : amount(pair.quote, qa);
+  const before = new Set(offC.map(o => o.seq));
+  const res = await client.submitAndWait({ TransactionType: 'OfferCreate', Account: wallet.address, TakerGets: gets, TakerPays: pays }, { wallet, autofill: true });
+  const code = res.result.meta.TransactionResult; if (code !== 'tesSUCCESS') throw new Error('limit order rejected: ' + code);
+  let seq = (res.result.tx_json || {}).Sequence ?? res.result.Sequence;
+  if (!seq) { await refreshOffers(true); const n = offC.find(o => !before.has(o.seq)); seq = n && n.seq; }
+  offAt = 0; balAt = 0; return seq || null;
+}
+async function cancelOffer(seq) {
+  if (!seq) return;
+  try { await client.submitAndWait({ TransactionType: 'OfferCancel', Account: wallet.address, OfferSequence: seq }, { wallet, autofill: true }); } catch (e) { log('cancel', seq, e.message); }
+  offAt = 0; balAt = 0;
+}
+function makePos(side, base, quote, entry, stop, target, why) {
+  const sh = side === 'SHORT';
+  P.pos = { side, base, cost: quote, entry, stop, target, userStop: false, entryCandleT: candles.cur.t, risk: Math.abs(entry - stop) * base, t0: Date.now(), stop0: stop, base0: base, done: [] };
+  P.tradesToday = (P.tradesToday || 0) + 1;
+  (P.marks ||= []).push({ t: candles.cur.t, price: entry, kind: sh ? 'short' : 'buy' }); if (P.marks.length > 200) P.marks.shift();
+  logTrade([new Date().toISOString(), pair.id, sh ? 'SHORT' : 'BUY', wallet ? 'live' : 'paper', why, base.toFixed(6), quote.toFixed(6), entry.toPrecision(8), '']);
+  addLog(sh ? 'sell' : 'buy', `${sh ? 'SHORT (sold ' : 'BUY ('}${base.toFixed(2)} ${sym(pair.base.currency)}) @ ${entry.toPrecision(6)} · stop ${stop.toPrecision(6)}${target ? ' · target ' + target.toPrecision(6) : ''}`);
+}
+// automatic stop-loss / take-profit from % of entry (slPct / tpPct), overriding structure stops when set
+function autoLv(sg, px, long) {
+  let stop = sg.stop, target = sg.target, stopPct = sg.stopPct;
+  if (cfg.slPct > 0) { stop = long ? px * (1 - cfg.slPct / 100) : px * (1 + cfg.slPct / 100); stopPct = cfg.slPct; }
+  if (cfg.tpPct > 0) target = long ? px * (1 + cfg.tpPct / 100) : px * (1 - cfg.tpPct / 100);
+  return { stop, target, stopPct };
+}
+// f: 0 = best bid (patient maker), 1 = best ask (marketable). The bot starts patient and walks the price toward the other side until filled.
+function limitPx(long, px, f) { const bid = last.bid, ask = last.ask; return bid && ask && bid < ask ? (long ? bid + f * (ask - bid) : ask - f * (ask - bid)) : (long ? px * (1 - 0.0004 + 0.0006 * f) : px * (1 + 0.0004 - 0.0006 * f)); }
+async function openLimit(long, px, stop, target, amt, why) {
+  const f0 = Math.min(1, Math.max(0, cfg.limitSpreadFrac ?? 0.3));
+  const lp = limitPx(long, px, f0);
+  const baseAmt = long ? amt / lp : amt;
+  if (baseAmt * lp < cfg.minTradeQuote) return false;
+  const pre = await balances(); balC = pre; balAt = Date.now();
+  const seq = await placeLimit(long ? 'BUY' : 'SELL', baseAmt, lp);
+  P.pend = { long, seq, price: lp, base: baseAmt, stop, target, why, t0: Date.now(), pre, sigPx: px, lastRe: Date.now(), f0 };
+  addLog('info', `LIMIT ${long ? 'BUY' : 'SELL-SHORT'} ${baseAmt.toFixed(4)} ${sym(pair.base.currency)} @ ${lp.toPrecision(6)} resting on the book (timeout ${cfg.limitTimeoutSec}s)`);
+  return true;
+}
+async function enter(long, px, stop, target, amt, why) {
+  if (cfg.entryMode === 'limit' && wallet && !MOCK && client) { try { return await openLimit(long, px, stop, target, amt, why); } catch (e) { addLog('info', 'limit entry failed (' + e.message + '), using market order'); } }
+  return long ? openPos(px, stop, target, amt, why) : openShort(px, stop, target, amt, why);
+}
+async function placeTp(pos) {
+  if (!cfg.tpLimit || !wallet || MOCK || !client || !pos.target || (cfg.tpLadder && cfg.tpLadder.length)) return;
+  try {
+    const seq = await placeLimit(pos.side === 'SHORT' ? 'BUY' : 'SELL', pos.base, pos.target);
+    pos.tp = { seq, left: pos.base, price: pos.target };
+    addLog('info', `TAKE-PROFIT resting on the book: ${pos.side === 'SHORT' ? 'buy' : 'sell'} ${pos.base.toFixed(4)} @ ${pos.target.toPrecision(6)}`);
+  } catch (e) { addLog('info', 'could not rest take-profit order: ' + e.message); }
+}
+async function handlePend(px, halt) {
+  const o = P.pend; await refreshOffers(true);
+  let live = o.seq ? offC.find(x => x.seq === o.seq) : null;
+  const age = (Date.now() - o.t0) / 1000, ch = cfg.limitChasePct / 100;
+  const away = o.long ? px > (o.sigPx || o.price) * (1 + ch) : px < (o.sigPx || o.price) * (1 - ch), dead = o.long ? px <= o.stop : px >= o.stop, timeout = age > cfg.limitTimeoutSec;
+  let why = null;
+  if (live && (halt || dead || away || timeout)) { await cancelOffer(o.seq); live = null; why = halt ? 'halt' : dead ? 'stop level hit first' : away ? 'price ran away' : 'timeout'; }
+  if (live) { // untouched resting order: walk it toward the market
+    if (!dead && live.base >= o.base * 0.999 && Date.now() - o.lastRe >= (cfg.limitRepriceSec || 4) * 1000) {
+      const f = Math.min(1.1, o.f0 + (1.1 - o.f0) * Math.min(1, age / (cfg.limitTimeoutSec * 0.7))), np = limitPx(o.long, px, f);
+      o.lastRe = Date.now();
+      if (Math.abs(np - o.price) / o.price > 0.00005) {
+        await cancelOffer(o.seq);
+        try { o.seq = await placeLimit(o.long ? 'BUY' : 'SELL', o.base, np); o.price = np; } catch (e) { addLog('info', 'reprice failed: ' + e.message); o.seq = null; }
+      }
+    }
+    return;
+  }
+  balAt = 0; const b = await balances(); balC = b; balAt = Date.now();
+  const dBase = o.long ? b.base - o.pre.base : o.pre.base - b.base, dQuote = Math.abs(b.quote - o.pre.quote);
+  P.pend = null;
+  if (dBase >= o.base * 0.05 && dBase * px >= cfg.minTradeQuote * 0.1) {
+    const entry = dBase > 0 ? dQuote / dBase : o.price, A = autoLv({ stop: o.stop, target: o.target, stopPct: 0 }, entry, o.long); // re-anchor % stop/target to the real fill
+    makePos(o.long ? 'LONG' : 'SHORT', dBase, dQuote, entry, A.stop, A.target, o.why + ' (limit)');
+    await placeTp(P.pos);
+  } else {
+    addLog('info', `limit entry not filled${why ? ' (' + why + ')' : ''}`);
+    if (why === 'price ran away') P.cooldownUntil = Date.now() + 20000;
+    if (why === 'timeout' && cfg.limitFallback && !halt && state.autoOn) { const amt = o.long ? o.base * px : o.base; await (o.long ? openPos(px, o.stop, o.target, amt, o.why + ' (market fallback)') : openShort(px, o.stop, o.target, amt, o.why + ' (market fallback)')); }
+  }
+}
+async function manageTp(px) {
+  const pos = P.pos; if (!pos || !pos.tp) return; await refreshOffers(true);
+  const o = offC.find(x => x.seq === pos.tp.seq), left = o ? o.base : 0, long = pos.side !== 'SHORT', c = candles.cur;
+  const reached = long ? Math.max(px, c ? c.high : px) >= pos.tp.price * 0.999 : Math.min(px, c ? c.low : px) <= pos.tp.price * 1.001;
+  if (!o && !reached) { pos.tp = null; addLog('info', 'take-profit order is gone from the book (cancelled elsewhere?), software exits still active'); return; }
+  const filled = pos.tp.left - left;
+  if (filled > 1e-9) { pos.tp.left = left; recordExit(filled, filled * pos.tp.price, pos.tp.price, 'take-profit (limit)'); }
+  if (P.pos && !o) P.pos.tp = null;
 }
 
 // ---------- strategy context / allocation ----------
@@ -238,8 +341,8 @@ const useFrac = () => Math.min(1, Math.max(0.05, (P.use ?? 100) / 100));
 let balC = null, balAt = 0, offC = [], offAt = 0, xuC = null, xuAt = 0;
 const amtOf = x => (typeof x === 'string' ? { cur: 'XRP', v: Number(x) / 1e6, iss: null } : { cur: x.currency, v: Number(x.value), iss: x.issuer });
 const isAsset = (x, a) => (isXRP(a) ? x.cur === 'XRP' : x.cur === a.currency && x.iss === a.issuer);
-async function refreshOffers() {
-  if (!wallet || MOCK || !client || Date.now() - offAt < 5000) return; offAt = Date.now();
+async function refreshOffers(force) {
+  if (!wallet || MOCK || !client || (!force && Date.now() - offAt < 5000)) return; offAt = Date.now();
   const r = await client.request({ command: 'account_offers', account: wallet.address, limit: 200 });
   offC = (r.result.offers || []).map(o => { const g = amtOf(o.taker_gets), p = amtOf(o.taker_pays);
     if (isAsset(g, pair.base) && isAsset(p, pair.quote)) return { seq: o.seq, side: 'SELL', price: p.v / g.v, base: g.v, quote: p.v, passive: !!((o.flags || 0) & 0x10000) };
@@ -277,14 +380,21 @@ async function tick() {
     try { await refreshOffers(); } catch (e) { last.offErr = e.message; }
     { const xu = await xuNow(px), qx = isXRP(pair.quote) ? 1 : (xu ? 1 / xu : null); last.fx = xu && qx ? { usd: qx * xu, xrp: qx, xu } : null; }
     const ctx = mkCtx();
+    last.plan = (() => { const cl = candles.closed; if (cl.length < 2) return null; const c2 = cl[cl.length - 1], bf = cfg.stopBufferPct / 100, mx = cfg.maxStopPct / 100, R = Math.max(cfg.takeProfitR || 2, 1.5);
+      const ls = Math.max(c2.low * (1 - bf), c2.high * (1 - mx)), ss2 = Math.min(c2.high * (1 + bf), c2.low * (1 + mx));
+      return { long: { trigger: c2.high, stop: ls, target: c2.high + (c2.high - ls) * R }, short: { trigger: c2.low, stop: ss2, target: c2.low - (ss2 - c2.low) * R }, shortsOn: !!state.shortOn }; })();
     if (P.goal > 0 && !P.goalHit && startEq && tradePnlPct >= P.goal) { P.goalHit = true; state.halted = `daily goal +${P.goal}% reached`; addLog('buy', 'DAILY GOAL reached: flattening, resumes tomorrow'); }
     const halt = fs.existsSync(F('STOP')) ? 'STOP file present' : state.halted;
+    if (P.pos && !(P.pos.base > 1e-9)) { addLog('info', 'cleared empty position record'); P.pos = null; }
+    if (P.pend) await handlePend(px, halt);
+    if (P.pos && P.pos.tp) await manageTp(px);
     if (P.pos) {
       const m = (P.pos.side === 'SHORT' ? S.manageShort : S.manage)(P.pos, px, candles.closed, cfg, ctx);
       P.pos.stop = m.stop;
-      if (m.partial && !m.exit && !halt) { const q = P.pos.base0 * m.partial; if (await closePos(px, `ladder ${m.level + 1}`, cfg.entrySlippagePct, Math.min(1, q / P.pos.base))) { if (P.pos) P.pos.done.push(m.level); } }
+      if (m.exit && m.reason === 'take-profit' && P.pos.tp) { /* resting limit handles it */ }
+      else if (m.partial && !m.exit && !halt) { const q = P.pos.base0 * m.partial; if (await closePos(px, `ladder ${m.level + 1}`, cfg.entrySlippagePct, Math.min(1, q / P.pos.base))) { if (P.pos) P.pos.done.push(m.level); } }
       else if (m.exit || halt) await closePos(px, halt ? 'halt: ' + halt : m.reason, m.reason === 'take-profit' ? cfg.entrySlippagePct : cfg.stopSlippagePct);
-    } else {
+    } else if (!P.pend) {
       const sig = S.entrySignal(candles.closed, px, cfg, ctx); last.sig = sig;
       if (closedNow) addLog('info', `candle closed H ${closedNow.high.toPrecision(6)} L ${closedNow.low.toPrecision(6)} | ${sig.why}`);
       if (!halt && state.autoOn) {
@@ -292,14 +402,14 @@ async function tick() {
         if (dd >= cfg.dailyLossHaltPct) { state.halted = `daily loss ${dd.toFixed(2)}% hit limit`; addLog('loss', 'HALT ' + state.halted); }
         else if (P.consec >= cfg.maxConsecutiveLosses) { state.halted = `${P.consec} losses in a row`; addLog('loss', 'HALT ' + state.halted); }
         else if (now >= P.cooldownUntil && sig.enter) {
-          const u = useFrac(), spend = S.sizeQuote(e * u, Math.min(b.quote, e * u), sig.stopPct, cfg, S.riskScale(P.consec, cfg));
-          if (spend >= cfg.minTradeQuote) await openPos(px, sig.stop, sig.target, spend, sig.why);
+          const A = autoLv(sig, px, true), u = useFrac(), spend = S.sizeQuote(e * u, Math.min(b.quote, e * u), A.stopPct, cfg, S.riskScale(P.consec, cfg));
+          if (spend >= cfg.minTradeQuote) await enter(true, px, A.stop, A.target, spend, sig.why);
           else { last.note = `SIGNAL but size ${spend.toFixed(3)} < min ${cfg.minTradeQuote} ${sym(pair.quote.currency)}: wallet too small (equity ${e.toFixed(3)}, spendable ${b.quote.toFixed(3)} ${sym(pair.quote.currency)})`; if (Date.now() - (last.noteAt || 0) > 60000) { last.noteAt = Date.now(); addLog('info', last.note); } }
         } else if (now >= P.cooldownUntil && state.shortOn) {
           const ss = S.shortSignal(candles.closed, px, cfg, ctx);
           if (ss.enter) {
-            const u = useFrac(), qty = S.sizeShortBase(e * u, px, ss.stop, b.base, cfg, S.riskScale(P.consec, cfg));
-            if (qty * px >= cfg.minTradeQuote) await openShort(px, ss.stop, ss.target, qty, ss.why);
+            const A = autoLv(ss, px, false), u = useFrac(), qty = S.sizeShortBase(e * u, px, A.stop, b.base, cfg, S.riskScale(P.consec, cfg));
+            if (qty * px >= cfg.minTradeQuote) await enter(false, px, A.stop, A.target, qty, ss.why);
           } else if (!sig.enter && sig.trend !== 'UP') last.sig = { ...sig, why: sig.why + ' · short: ' + ss.why };
         }
       }
@@ -315,7 +425,7 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    ver: 2.1, offers: offC, fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 2.1, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
@@ -334,7 +444,7 @@ const routes = {
     wallet = w; addLog('info', 'Wallet connected: ' + w.address); loadPair(); return { address: w.address };
   },
   'POST /api/disconnect': async () => { if (P.pos) throw new Error('Close the open position first'); wallet = null; addLog('info', 'Wallet disconnected (seed cleared from memory)'); loadPair(); return {}; },
-  'POST /api/pair': async (b) => { if (P.pos) throw new Error('Close the open position before switching pairs'); const p = pairById(b.id); if (!p) throw new Error('unknown pair'); save(); pair = p; loadPair(); last = { px: null, sig: { trend: 'NONE', why: 'warming up' }, err: null }; return {}; },
+  'POST /api/pair': async (b) => { if (P.pos || P.pend) throw new Error('Close the open position / pending order before switching pairs'); const p = pairById(b.id); if (!p) throw new Error('unknown pair'); save(); pair = p; loadPair(); last = { px: null, sig: { trend: 'NONE', why: 'warming up' }, err: null }; return {}; },
   'POST /api/addpair': async (b) => {
     const symb = String(b.symbol || '').trim(), issuer = String(b.issuer || '').trim(), qt = b.quote === 'XRP' ? XRP : RLUSD;
     if (!symb || !xrpl.isValidClassicAddress(issuer)) throw new Error('need a currency code and a valid issuer address');
@@ -347,6 +457,7 @@ const routes = {
     const sh = P.pos.side === 'SHORT';
     if (b.stop != null) { const s = num(b.stop, 'stop'); if (sh ? s <= last.px : s >= last.px) throw new Error(sh ? 'Short stop must be above the price' : 'Stop must be below the current price'); P.pos.stop = s; P.pos.userStop = true; }
     if (b.target !== undefined) { P.pos.target = b.target == null ? null : num(b.target, 'target'); if (P.pos.target && (sh ? P.pos.target >= last.px : P.pos.target <= last.px)) throw new Error(sh ? 'Short target must be below the price' : 'Target must be above the current price'); }
+    if (P.pos.tp && b.target !== undefined) { await cancelOffer(P.pos.tp.seq); P.pos.tp = null; if (P.pos.target) await placeTp(P.pos); }
     save(); return {};
   }),
   'POST /api/buy': async (b) => locked(async () => {
@@ -369,7 +480,7 @@ const routes = {
     P.pos.userStop = true; save(); return {};
   }),
   'POST /api/shorton': async (b) => { state.shortOn = !!b.on; return {}; },
-  'POST /api/sell': async () => locked(async () => { if (!P.pos) throw new Error('No open position'); const px = await price(); if (!(await closePos(px, 'manual', cfg.stopSlippagePct))) throw new Error('Order not filled'); save(); return {}; }),
+  'POST /api/sell': async () => locked(async () => { if (P.pend) { await cancelOffer(P.pend.seq); P.pend = null; } if (!P.pos) throw new Error('No open position'); const px = await price(); if (!(await closePos(px, 'manual', cfg.stopSlippagePct))) throw new Error('Order not filled'); save(); return {}; }),
   'POST /api/auto': async (b) => { state.autoOn = !!b.on; return {}; },
   'POST /api/kill': async () => { state.halted = 'kill switch'; addLog('loss', 'Kill switch pressed'); return {}; },
   'POST /api/resume': async () => { state.halted = null; P.consec = 0; P.dayPnl = 0; startEq = null; addLog('info', 'Resumed'); return {}; },
@@ -391,7 +502,7 @@ const routes = {
     if (P.pos) P.pos.entryCandleT = candles.cur ? candles.cur.t : P.pos.entryCandleT;
     P.marks = []; save(); addLog('info', `timeframe ${m}m · rebuilt ${candles.closed.length} candles from ${P.ticks.length} live ticks`); return {};
   }),
-  'POST /api/flatten': async () => locked(async () => { if (!P.pos) return {}; const px = await price(); if (!(await closePos(px, 'flatten', cfg.stopSlippagePct))) throw new Error('Order not filled'); save(); return {}; }),
+  'POST /api/flatten': async () => locked(async () => { if (P.pend) { await cancelOffer(P.pend.seq); P.pend = null; } if (!P.pos) return {}; const px = await price(); if (!(await closePos(px, 'flatten', cfg.stopSlippagePct))) throw new Error('Order not filled'); save(); return {}; }),
   'POST /api/take': async (b) => locked(async () => { if (!P.pos) throw new Error('No open position'); const px = await price(); const f = Math.min(1, Math.max(0.05, +b.frac || 0.5)); if (!(await closePos(px, 'take profit', cfg.entrySlippagePct, f))) throw new Error('Order not filled'); save(); return {}; }),
   'POST /api/hedge': async () => { throw new Error('Hedge (long+short) is simulator-only for now'); },
   'POST /api/smart': async () => { throw new Error('Smart Auto is simulator-only for now'); },
