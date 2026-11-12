@@ -232,6 +232,7 @@ async function tick() {
     const dk = new Date().toISOString().slice(0, 10);
     if (dk !== dayKey) { dayKey = dk; startEq = e; P.tradesToday = 0; P.goalHit = false; if (state.halted && /daily goal/.test(state.halted)) state.halted = null; }
     eq.push(e); if (eq.length > 600) eq.shift();
+    last.eq = e; last.note = e * useFrac() < cfg.minTradeQuote * 2 ? `Wallet too small to trade: equity ${e.toFixed(3)} ${sym(pair.quote.currency)} (XRP counted only above reserve + ${cfg.xrpReserveBuffer} buffer). Needs roughly ${(cfg.minTradeQuote * 2).toFixed(0)}+ to place orders.` : null;
     const ctx = mkCtx();
     if (P.goal > 0 && !P.goalHit && startEq && ((e - startEq) / startEq) * 100 >= P.goal) { P.goalHit = true; state.halted = `daily goal +${P.goal}% reached`; addLog('buy', 'DAILY GOAL reached: flattening, resumes tomorrow'); }
     const halt = fs.existsSync(F('STOP')) ? 'STOP file present' : state.halted;
@@ -250,6 +251,7 @@ async function tick() {
         else if (now >= P.cooldownUntil && sig.enter) {
           const u = useFrac(), spend = S.sizeQuote(e * u, Math.min(b.quote, e * u), sig.stopPct, cfg, S.riskScale(P.consec, cfg));
           if (spend >= cfg.minTradeQuote) await openPos(px, sig.stop, sig.target, spend, sig.why);
+          else { last.note = `SIGNAL but size ${spend.toFixed(3)} < min ${cfg.minTradeQuote} ${sym(pair.quote.currency)}: wallet too small (equity ${e.toFixed(3)}, spendable ${b.quote.toFixed(3)} ${sym(pair.quote.currency)})`; if (Date.now() - (last.noteAt || 0) > 60000) { last.noteAt = Date.now(); addLog('info', last.note); } }
         } else if (now >= P.cooldownUntil && state.shortOn) {
           const ss = S.shortSignal(candles.closed, px, cfg, ctx);
           if (ss.enter) {
@@ -274,7 +276,7 @@ const view = () => {
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
-    use: P.use ?? 100, goal: P.goal || 0, goalHit: !!P.goalHit, trades: state.trades.filter(t => !t.pair || t.pair === pair.id).slice(-300), marks: (P.marks || []).slice(-120), eq, start: startEq, logs, cfg, consec: P.consec,
+    use: P.use ?? 100, goal: P.goal || 0, goalHit: !!P.goalHit, trades: state.trades.filter(t => !t.pair || t.pair === pair.id).slice(-300), marks: (P.marks || []).slice(-120), eq, start: startEq, logs, cfg: { ...S.DEFAULTS, ...cfg }, consec: P.consec, bal: balC, eqNow: last.eq ?? null, note: last.note || null,
   };
 };
 const body = req => new Promise((res, rej) => { let d = ''; req.on('data', c => { d += c; if (d.length > 20000) { rej(new Error('too large')); req.destroy(); } }); req.on('end', () => { try { res(d ? JSON.parse(d) : {}); } catch (e) { rej(e); } }); });

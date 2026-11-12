@@ -5,7 +5,7 @@
     "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
   },
   "timeframeMinutes": 5,
-  "pollSeconds": 5,
+  "pollSeconds": 3,
   "stopBufferPct": 0.15,
   "maxStopPct": 3,
   "takeProfitR": 2,
