@@ -243,6 +243,7 @@ function recordExit(rBase, rQuote, rPrice, reason) {
   const portion = Math.min(1, rBase / pos.base);
   const pnl = short ? pos.cost * portion - rQuote : rQuote - pos.cost * portion;
   P.dayPnl = (P.dayPnl || 0) + pnl;
+  if (pnl < 0 && /stop/.test(reason)) P.lastStop = { t: Date.now(), long: !short };
   pos.cost -= pos.cost * portion; pos.base -= rBase;
   state.trades.push({ t: Date.now(), pair: pair.id, side: short ? 'SHORT' : 'LONG', entry: pos.entry, exit: rPrice, pnl: +pnl.toFixed(6), r: pos.risk ? +(pnl / (pos.risk * portion)).toFixed(3) : null, reason, bars: pos.t0 ? Math.max(0, Math.round((Date.now() - pos.t0) / candles.tf)) : 0 }); if (state.trades.length > 500) state.trades.shift();
   (P.marks ||= []).push({ t: candles.cur.t, price: rPrice, kind: short ? 'cover' : 'sell' });
@@ -334,7 +335,11 @@ async function handlePend(px, halt) {
     await placeTp(P.pos);
   } else {
     addLog('info', `limit entry not filled${why ? ' (' + why + ')' : ''}`);
-    if (why === 'price ran away') P.cooldownUntil = Date.now() + 20000;
+    if (why === 'price ran away' && cfg.limitFallback && !halt && state.autoOn && (cfg.alwaysIn || cfg.chaseMarket)) { // trend is running: take it at market with the same stop distance instead of missing it
+      const d = px - (o.sigPx || o.price), st = o.stop + d, tg = o.target ? o.target + d : o.target, amt = o.long ? o.base * px : o.base;
+      addLog('info', 'price ran away: entering at market with the stop distance preserved');
+      await (o.long ? openPos(px, st, tg, amt, o.why + ' (market chase)') : openShort(px, st, tg, amt, o.why + ' (market chase)'));
+    } else if (why === 'price ran away') P.cooldownUntil = Date.now() + 20000;
     if (why === 'timeout' && cfg.limitFallback && !halt && state.autoOn) { const amt = o.long ? o.base * px : o.base; await (o.long ? openPos(px, o.stop, o.target, amt, o.why + ' (market fallback)') : openShort(px, o.stop, o.target, amt, o.why + ' (market fallback)')); }
   }
 }
@@ -436,7 +441,16 @@ async function tick() {
         }
         // ALWAYS-IN-MARKET: if no breakout signal fired and we're flat, take the side the trend favours right now (same candle-structure stop/target).
         if (cfg.alwaysIn && !P.pos && !P.pend && !state.halted && Date.now() >= P.cooldownUntil && last.plan) {
-          const cl = candles.closed, c2 = cl[cl.length - 1], up = sig.trend === 'UP' ? true : sig.trend === 'DOWN' ? false : px >= c2.close;
+          const cl = candles.closed, c2 = cl[cl.length - 1];
+          // side vote: candle-structure trend, EMA 9/21, last-candle slope, recent tick momentum, and a penalty on the side that just stopped out
+          const ema = (arr, n) => { const k = 2 / (n + 1); let v = arr[0]; for (const x of arr) v = x * k + v * (1 - k); return v; }, cs = cl.slice(-40).map(c => c.close);
+          let score = (sig.trend === 'UP' ? 1 : sig.trend === 'DOWN' ? -1 : 0) + (cs.length >= 21 ? (ema(cs, 9) > ema(cs, 21) ? 1 : -1) : 0) + (cl.length >= 2 ? (c2.close >= cl[cl.length - 2].close ? 0.5 : -0.5) : 0);
+          const tk = P.ticks.slice(-40).map(t => t[1]); if (tk.length >= 10) score += px >= tk.reduce((a, b) => a + b, 0) / tk.length ? 0.5 : -0.5;
+          if (P.lastStop && Date.now() - P.lastStop.t < cfg.timeframeMinutes * 60000 * 3) score += P.lastStop.long ? -1.5 : 1.5;
+          const up = score > 0 ? true : score < 0 ? false : px >= c2.close;
+          // cost guard: expected candle range must clearly exceed the round-trip spread, otherwise fees/spread eat the edge
+          const spreadPct = last.ask && last.bid ? (last.ask - last.bid) / px * 100 : 0;
+          if (ctx.atrPct != null && ctx.atrPct < 2 * spreadPct) { if (Date.now() - (last.noteAt || 0) > 60000) { last.noteAt = Date.now(); addLog('info', `always-in paused: range ${ctx.atrPct.toFixed(3)}% < 2x spread ${spreadPct.toFixed(3)}%`); } } else {
           const can = (long) => { const lv = long ? last.plan.long : last.plan.short, A = autoLv({ stop: lv.stop, target: lv.target, stopPct: 0 }, px, long), u = useFrac(), rs = S.riskScale(P.consec, cfg);
             const q = long ? S.sizeQuote(e * u, Math.min(b.quote, e * u), A.stopPct, cfg, rs) : S.sizeShortBase(e * u, px, A.stop, b.base, cfg, rs);
             return { A, q, ok: long ? q >= cfg.minTradeQuote : q * px >= cfg.minTradeQuote }; };
@@ -445,6 +459,7 @@ async function tick() {
           else if (!up && Sh.ok) await enter(false, px, Sh.A.stop, Sh.A.target, Sh.q, 'always-in: trend DOWN');
           else if (!up && !state.shortOn && L.ok && cfg.alwaysInLongOnDown) await enter(true, px, L.A.stop, L.A.target, L.q, 'always-in: long (shorts off)');
           else if (Date.now() - (last.noteAt || 0) > 60000) { last.noteAt = Date.now(); addLog('info', `always-in waiting: trend ${up ? 'UP' : 'DOWN'}, ${up ? 'long size too small' : state.shortOn ? 'short unavailable (needs XRP above reserve)' : 'shorts are OFF'}`); }
+          }
         }
       }
     }
@@ -459,7 +474,7 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    ver: 2.1, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 2.6, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
@@ -631,6 +646,7 @@ async function main() {
   if (process.env.BOT_SEED) { wallet = xrpl.Wallet.fromSeed(process.env.BOT_SEED.trim()); delete process.env.BOT_SEED; }
   loadPair();
   if (!MOCK) await connectClient(0);
+  server.on('error', e => { if (e.code === 'EADDRINUSE') { console.error(`\nPort ${PORT} is already in use: an OLD TRENDBOT is still running and is what your browser is showing.\nStop it first: run STOP-TRENDBOT.command, or in Terminal: pkill -f "node bot.js", then start again.\n`); process.exit(1); } throw e; });
   server.listen(PORT, '127.0.0.1', () => log(`TRENDBOT UI: http://127.0.0.1:${PORT} | ${wallet ? 'LIVE ' + wallet.address : 'PAPER (import a wallet on the Wallet page for live)'}${MOCK ? ' | MOCK PRICES' : ''}`));
   setInterval(tick, cfg.pollSeconds * 1000); tick(); refPrice(); setInterval(refPrice, 10000);
 }
