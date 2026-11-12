@@ -15,9 +15,9 @@
   "stopSlippagePct": 1.5,
   "dailyLossHaltPct": 3,
   "maxConsecutiveLosses": 3,
-  "xrpReserveBuffer": 3,
+  "xrpReserveBuffer": 0.5,
   "cooldownCandles": 1,
-  "minTradeQuote": 5,
+  "minTradeQuote": 0.01,
   "uiPort": 8787,
   "shortInventoryPct": 50
 }

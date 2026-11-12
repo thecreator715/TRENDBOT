@@ -208,7 +208,7 @@ async function closePos(px, reason, slip, frac = 1) {
   (P.marks ||= []).push({ t: candles.cur.t, price: r.price, kind: short ? 'cover' : 'sell' });
   logTrade([new Date().toISOString(), pair.id, short ? 'COVER' : 'SELL', wallet ? 'live' : 'paper', reason, r.base.toFixed(6), r.quote.toFixed(6), r.price.toPrecision(8), pnl.toFixed(6)]);
   addLog(pnl < 0 ? 'loss' : 'sell', `${short ? 'COVER' : 'SELL'} ${r.base.toFixed(2)} @ ${r.price.toPrecision(6)} · ${reason} · ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} ${sym(pair.quote.currency)}`);
-  if (pos.base < 1e-6 || pos.base * px < 0.5 || (short && portion > 0.98)) { P.consec = pnl < 0 ? P.consec + 1 : 0; P.cooldownUntil = (candles.cur?.t || Date.now()) + cfg.cooldownCandles * cfg.timeframeMinutes * 60_000; P.pos = null; }
+  if (pos.base < 1e-6 || pos.base * px < Math.max(1e-6, cfg.minTradeQuote * 0.1) || (short && portion > 0.98)) { P.consec = pnl < 0 ? P.consec + 1 : 0; P.cooldownUntil = (candles.cur?.t || Date.now()) + cfg.cooldownCandles * cfg.timeframeMinutes * 60_000; P.pos = null; }
   return true;
 }
 
