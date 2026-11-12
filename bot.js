@@ -147,6 +147,7 @@ async function balances() {
 // ---------- execution ----------
 const amount = (a, v) => (isXRP(a) ? xrpl.xrpToDrops(Number(v).toFixed(6)) : { currency: a.currency, issuer: a.issuer, value: Number(v).toPrecision(12) });
 async function swap(side, amountIn, px, slipPct) {
+  balAt = 0;
   if (!wallet) { // paper fill
     const p = side === 'BUY' ? px * (1 + slipPct / 200) : px * (1 - slipPct / 200);
     if (side === 'BUY') { P.paper.quote -= amountIn; P.paper.base += amountIn / p; return { filled: true, base: amountIn / p, quote: amountIn, price: p }; }
@@ -214,17 +215,18 @@ async function closePos(px, reason, slip, frac = 1) {
 // ---------- strategy context / allocation ----------
 const mkCtx = () => S.ctxFrom(candles.closed, S.aggregate(candles.closed, candles.cur, cfg.htfMult || 4), { tradesToday: P.tradesToday || 0 });
 const useFrac = () => Math.min(1, Math.max(0.05, (P.use ?? 100) / 100));
+let balC = null, balAt = 0;
 // ---------- main tick ----------
 let last = { px: null, sig: { trend: 'NONE', why: 'warming up' }, err: null };
 const equityOf = (b, px) => b.quote + b.base * px;
 async function tick() {
   if (busy) return; busy = true;
   try {
-    const px = await price(); last.px = px; last.err = null;
+    const px = await price(); last.px = px; last.err = null; last.at = Date.now();
     const now = Date.now();
     P.ticks.push([now, px]);
     const closedNow = candles.push(now, px);
-    const b = await balances();
+    const b = (Date.now() - balAt < 8000 && balC) ? balC : await balances(); balC = b; balAt = Date.now();
     const e = equityOf(b, px);
     if (startEq == null) startEq = e;
     const dk = new Date().toISOString().slice(0, 10);
@@ -268,7 +270,7 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 2.1, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
