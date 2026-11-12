@@ -1,0 +1,23 @@
+{
+  "server": "wss://xrplcluster.com",
+  "rlusd": {
+    "currency": "524C555344000000000000000000000000000000",
+    "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
+  },
+  "timeframeMinutes": 60,
+  "pollSeconds": 15,
+  "stopBufferPct": 0.15,
+  "maxStopPct": 3,
+  "takeProfitR": 2,
+  "riskPerTradePct": 1,
+  "maxPositionPct": 50,
+  "entrySlippagePct": 0.4,
+  "stopSlippagePct": 1.5,
+  "dailyLossHaltPct": 3,
+  "maxConsecutiveLosses": 3,
+  "xrpReserveBuffer": 3,
+  "cooldownCandles": 1,
+  "minTradeQuote": 5,
+  "uiPort": 8787,
+  "shortInventoryPct": 50
+}

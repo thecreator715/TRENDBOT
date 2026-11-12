@@ -1,0 +1,8 @@
+node_modules/
+state.json
+state.json.tmp
+trades.csv
+pairs.json
+STOP
+*.zip
+.env
