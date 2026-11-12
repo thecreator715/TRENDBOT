@@ -222,6 +222,7 @@ async function closePos(px, reason, slip, frac = 1) {
   if (!r.filled) { addLog('info', `exit not filled (${r.code}); retrying next tick`); return false; }
   const portion = Math.min(1, r.base / pos.base);
   const pnl = short ? pos.cost * portion - r.quote : r.quote - pos.cost * portion;
+  P.dayPnl = (P.dayPnl || 0) + pnl;
   pos.cost -= pos.cost * portion; pos.base -= r.base;
   state.trades.push({ t: Date.now(), pair: pair.id, side: short ? 'SHORT' : 'LONG', entry: pos.entry, exit: r.price, pnl: +pnl.toFixed(6), r: pos.risk ? +(pnl / (pos.risk * portion)).toFixed(3) : null, reason, bars: pos.t0 ? Math.max(0, Math.round((Date.now() - pos.t0) / candles.tf)) : 0 }); if (state.trades.length > 500) state.trades.shift();
   (P.marks ||= []).push({ t: candles.cur.t, price: r.price, kind: short ? 'cover' : 'sell' });
@@ -234,7 +235,24 @@ async function closePos(px, reason, slip, frac = 1) {
 // ---------- strategy context / allocation ----------
 const mkCtx = () => S.ctxFrom(candles.closed, S.aggregate(candles.closed, candles.cur, cfg.htfMult || 4), { tradesToday: P.tradesToday || 0 });
 const useFrac = () => Math.min(1, Math.max(0.05, (P.use ?? 100) / 100));
-let balC = null, balAt = 0;
+let balC = null, balAt = 0, offC = [], offAt = 0, xuC = null, xuAt = 0;
+const amtOf = x => (typeof x === 'string' ? { cur: 'XRP', v: Number(x) / 1e6, iss: null } : { cur: x.currency, v: Number(x.value), iss: x.issuer });
+const isAsset = (x, a) => (isXRP(a) ? x.cur === 'XRP' : x.cur === a.currency && x.iss === a.issuer);
+async function refreshOffers() {
+  if (!wallet || MOCK || !client || Date.now() - offAt < 5000) return; offAt = Date.now();
+  const r = await client.request({ command: 'account_offers', account: wallet.address, limit: 200 });
+  offC = (r.result.offers || []).map(o => { const g = amtOf(o.taker_gets), p = amtOf(o.taker_pays);
+    if (isAsset(g, pair.base) && isAsset(p, pair.quote)) return { seq: o.seq, side: 'SELL', price: p.v / g.v, base: g.v, quote: p.v, passive: !!((o.flags || 0) & 0x10000) };
+    if (isAsset(g, pair.quote) && isAsset(p, pair.base)) return { seq: o.seq, side: 'BUY', price: g.v / p.v, base: p.v, quote: g.v, passive: !!((o.flags || 0) & 0x10000) };
+    return null; }).filter(Boolean);
+}
+// XRP price in RLUSD, for $ / XRP valuation of any pair
+async function xuNow(px) {
+  if (pair.id === 'XRP/RLUSD') return px;
+  if (MOCK || !client) return xuC || 1;
+  if (Date.now() - xuAt < 20000 && xuC) return xuC; xuAt = Date.now();
+  try { xuC = (await ammInfo(pairById('XRP/RLUSD'))).spot; } catch {} return xuC;
+}
 // ---------- main tick ----------
 let last = { px: null, sig: { trend: 'NONE', why: 'warming up' }, err: null };
 const equityOf = (b, px) => b.quote + b.base * px;
@@ -246,15 +264,20 @@ async function tick() {
     try { await dexWicks(pair, px); } catch (e) { last.dexErr = e.message; }
     P.ticks.push([now, px]);
     const closedNow = candles.push(now, px);
-    const b = (Date.now() - balAt < 8000 && balC) ? balC : await balances(); balC = b; balAt = Date.now();
+    let b = balC; if (!(Date.now() - balAt < 8000 && balC)) { b = await balances(); balC = b; balAt = Date.now(); }
     const e = equityOf(b, px);
     if (startEq == null) startEq = e;
     const dk = new Date().toISOString().slice(0, 10);
-    if (dk !== dayKey) { dayKey = dk; startEq = e; P.tradesToday = 0; P.goalHit = false; if (state.halted && /daily goal/.test(state.halted)) state.halted = null; }
+    if (dk !== dayKey) { dayKey = dk; startEq = e; P.tradesToday = 0; P.dayPnl = 0; P.goalHit = false; if (state.halted && /daily goal/.test(state.halted)) state.halted = null; }
     eq.push(e); if (eq.length > 600) eq.shift();
+    const unreal = P.pos ? (P.pos.side === 'SHORT' ? P.pos.cost - P.pos.base * px : P.pos.base * px - P.pos.cost) : 0;
+    const tradePnlPct = ((P.dayPnl || 0) + unreal) / Math.max(1e-9, startEq * useFrac()) * 100; // trading P/L only, not idle-inventory price moves
+    last.tp = tradePnlPct;
     last.eq = e; last.note = e * useFrac() < cfg.minTradeQuote * 2 ? `Wallet too small to trade: equity ${e.toFixed(3)} ${sym(pair.quote.currency)} (XRP counted only above reserve + ${cfg.xrpReserveBuffer} buffer). Needs roughly ${(cfg.minTradeQuote * 2).toFixed(0)}+ to place orders.` : null;
+    try { await refreshOffers(); } catch (e) { last.offErr = e.message; }
+    { const xu = await xuNow(px), qx = isXRP(pair.quote) ? 1 : (xu ? 1 / xu : null); last.fx = xu && qx ? { usd: qx * xu, xrp: qx, xu } : null; }
     const ctx = mkCtx();
-    if (P.goal > 0 && !P.goalHit && startEq && ((e - startEq) / startEq) * 100 >= P.goal) { P.goalHit = true; state.halted = `daily goal +${P.goal}% reached`; addLog('buy', 'DAILY GOAL reached: flattening, resumes tomorrow'); }
+    if (P.goal > 0 && !P.goalHit && startEq && tradePnlPct >= P.goal) { P.goalHit = true; state.halted = `daily goal +${P.goal}% reached`; addLog('buy', 'DAILY GOAL reached: flattening, resumes tomorrow'); }
     const halt = fs.existsSync(F('STOP')) ? 'STOP file present' : state.halted;
     if (P.pos) {
       const m = (P.pos.side === 'SHORT' ? S.manageShort : S.manage)(P.pos, px, candles.closed, cfg, ctx);
@@ -265,7 +288,7 @@ async function tick() {
       const sig = S.entrySignal(candles.closed, px, cfg, ctx); last.sig = sig;
       if (closedNow) addLog('info', `candle closed H ${closedNow.high.toPrecision(6)} L ${closedNow.low.toPrecision(6)} | ${sig.why}`);
       if (!halt && state.autoOn) {
-        const dd = ((startEq - e) / startEq) * 100;
+        const dd = -tradePnlPct;
         if (dd >= cfg.dailyLossHaltPct) { state.halted = `daily loss ${dd.toFixed(2)}% hit limit`; addLog('loss', 'HALT ' + state.halted); }
         else if (P.consec >= cfg.maxConsecutiveLosses) { state.halted = `${P.consec} losses in a row`; addLog('loss', 'HALT ' + state.halted); }
         else if (now >= P.cooldownUntil && sig.enter) {
@@ -292,7 +315,7 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    ver: 2.1, dexN: last.dexN || 0, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 2.1, offers: offC, fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
@@ -349,7 +372,7 @@ const routes = {
   'POST /api/sell': async () => locked(async () => { if (!P.pos) throw new Error('No open position'); const px = await price(); if (!(await closePos(px, 'manual', cfg.stopSlippagePct))) throw new Error('Order not filled'); save(); return {}; }),
   'POST /api/auto': async (b) => { state.autoOn = !!b.on; return {}; },
   'POST /api/kill': async () => { state.halted = 'kill switch'; addLog('loss', 'Kill switch pressed'); return {}; },
-  'POST /api/resume': async () => { state.halted = null; P.consec = 0; startEq = null; addLog('info', 'Resumed'); return {}; },
+  'POST /api/resume': async () => { state.halted = null; P.consec = 0; P.dayPnl = 0; startEq = null; addLog('info', 'Resumed'); return {}; },
   'POST /api/config': async (b) => {
     const D = S.DEFAULTS; if (!D) throw new Error('strategy defaults unavailable');
     for (const k of Object.keys(b)) {
@@ -372,6 +395,31 @@ const routes = {
   'POST /api/take': async (b) => locked(async () => { if (!P.pos) throw new Error('No open position'); const px = await price(); const f = Math.min(1, Math.max(0.05, +b.frac || 0.5)); if (!(await closePos(px, 'take profit', cfg.entrySlippagePct, f))) throw new Error('Order not filled'); save(); return {}; }),
   'POST /api/hedge': async () => { throw new Error('Hedge (long+short) is simulator-only for now'); },
   'POST /api/smart': async () => { throw new Error('Smart Auto is simulator-only for now'); },
+  'POST /api/limit': async (b) => locked(async () => {
+    if (!wallet) throw new Error('Connect a wallet to place real orders'); if (MOCK) throw new Error('mock mode');
+    const side = b.side === 'sell' ? 'SELL' : 'BUY', pr = num(b.price, 'price'), amtB = num(b.amount, 'amount'), px = last.px;
+    if (px && Math.abs(pr - px) / px > 0.5) throw new Error('Limit price is more than 50% from the market, check it');
+    if (amtB * pr < cfg.minTradeQuote) throw new Error('Order too small');
+    const bal = await balances();
+    if (side === 'BUY' && amtB * pr > bal.quote + 1e-9) throw new Error(`Need ${(amtB * pr).toFixed(4)} ${sym(pair.quote.currency)}, spendable ${bal.quote.toFixed(4)}`);
+    if (side === 'SELL' && amtB > bal.base + 1e-9) throw new Error(`Need ${amtB} ${sym(pair.base.currency)}, spendable ${bal.base.toFixed(4)}`);
+    const gets = side === 'BUY' ? amount(pair.quote, amtB * pr) : amount(pair.base, amtB), pays = side === 'BUY' ? amount(pair.base, amtB) : amount(pair.quote, amtB * pr);
+    const res = await client.submitAndWait({ TransactionType: 'OfferCreate', Account: wallet.address, TakerGets: gets, TakerPays: pays }, { wallet, autofill: true });
+    const code = res.result.meta.TransactionResult; offAt = 0; balAt = 0;
+    if (code !== 'tesSUCCESS') throw new Error('Order rejected: ' + code);
+    addLog('info', `LIMIT ${side} ${amtB} ${sym(pair.base.currency)} @ ${pr} placed (rests on the book until filled or cancelled)`); return {};
+  }),
+  'POST /api/cancel': async (b) => locked(async () => {
+    if (!wallet) throw new Error('No wallet'); const seq = Math.round(+b.seq); if (!(seq > 0)) throw new Error('bad order sequence');
+    if (!offC.some(o => o.seq === seq)) throw new Error('That order is not on this pair');
+    const res = await client.submitAndWait({ TransactionType: 'OfferCancel', Account: wallet.address, OfferSequence: seq }, { wallet, autofill: true });
+    offAt = 0; balAt = 0; const code = res.result.meta.TransactionResult; if (code !== 'tesSUCCESS') throw new Error('Cancel failed: ' + code); addLog('info', 'Order #' + seq + ' cancelled'); return {};
+  }),
+  'POST /api/cancelall': async () => locked(async () => {
+    if (!wallet) throw new Error('No wallet'); let n = 0;
+    for (const o of [...offC]) { await client.submitAndWait({ TransactionType: 'OfferCancel', Account: wallet.address, OfferSequence: o.seq }, { wallet, autofill: true }); n++; }
+    offAt = 0; balAt = 0; addLog('info', `Cancelled ${n} open order(s) on ${pair.id}`); return { n };
+  }),
   'POST /api/alloc': async (b) => { if (b.use != null) P.use = Math.min(100, Math.max(5, +b.use || 100)); if (b.goal != null) P.goal = Math.min(50, Math.max(0, +b.goal || 0)); save(); return { use: P.use ?? 100, goal: P.goal || 0 }; },
 };
 
@@ -395,7 +443,7 @@ const server = http.createServer(async (req, res) => {
 async function main() {
   if (process.env.BOT_SEED) { wallet = xrpl.Wallet.fromSeed(process.env.BOT_SEED.trim()); delete process.env.BOT_SEED; }
   loadPair();
-  if (!MOCK) { client = new xrpl.Client(cfg.server); client.on('disconnected', () => log('disconnected, reconnecting')); await client.connect(); }
+  if (!MOCK) { client = new xrpl.Client(process.env.TB_SERVER || cfg.server); client.on('disconnected', () => log('disconnected, reconnecting')); await client.connect(); }
   server.listen(PORT, '127.0.0.1', () => log(`TRENDBOT UI: http://127.0.0.1:${PORT} | ${wallet ? 'LIVE ' + wallet.address : 'PAPER (import a wallet on the Wallet page for live)'}${MOCK ? ' | MOCK PRICES' : ''}`));
   setInterval(tick, cfg.pollSeconds * 1000); tick();
 }

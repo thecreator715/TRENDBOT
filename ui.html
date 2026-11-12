@@ -224,7 +224,7 @@ body.chartonly .colB,body.chartonly .colC{display:none!important}body.chartonly 
   </div>
 
   <div class="card colC">
-    <div class="ptabs"><button class="ptab chip on" data-p="smart">Smart</button><button class="ptab chip" data-p="exits">Exits</button><button class="ptab chip" data-p="config">Config</button><button class="ptab chip" data-p="risk">Risk</button><button class="ptab chip" data-p="log">Log</button><button class="ptab chip" data-p="equity">Equity</button><button class="ptab chip" data-p="tools">Tools</button></div>
+    <div class="ptabs"><button class="ptab chip on" data-p="smart">Smart</button><button class="ptab chip" data-p="exits">Exits</button><button class="ptab chip" data-p="config">Config</button><button class="ptab chip" data-p="risk">Risk</button><button class="ptab chip" data-p="log">Log</button><button class="ptab chip" data-p="equity">Equity</button><button class="ptab chip" data-p="orders">Orders</button><button class="ptab chip" data-p="tools">Tools</button></div>
 
     <div class="pane on" data-p="smart">
       <div class="brain"><h2><span>Smart Auto brain</span><span class="badge b-no" id="brainBadge">—</span></h2><div id="brain"></div></div>
@@ -267,7 +267,15 @@ body.chartonly .colB,body.chartonly .colC{display:none!important}body.chartonly 
       <div id="eqStats" style="margin-top:8px"></div>
     </div>
 
-    <div class="pane" data-p="tools">
+    <div class="pane" data-p="orders">
+  <h2><span>Open orders · <b id="ordPair">—</b></span><button class="sm kill" id="ordCancelAll">Cancel all</button></h2>
+  <div class="note" id="ordNote"></div>
+  <table class="tr"><thead><tr><th>SIDE</th><th>PRICE</th><th>AMOUNT</th><th>VALUE</th><th></th></tr></thead><tbody id="ordTbl"><tr><td colspan="5" class="k">—</td></tr></tbody></table>
+  <h2 style="margin-top:12px"><span>Place limit order</span><span class="k">rests on the XRPL book</span></h2>
+  <div class="ctrl"><select id="lmSide"><option value="buy">Buy</option><option value="sell">Sell</option></select><input type="number" id="lmPx" placeholder="price" step="any" style="width:90px"><input type="number" id="lmAmt" placeholder="amount (base)" step="any" style="width:110px"><button class="primary" id="lmGo">Place</button></div>
+  <div class="note">Limit orders are real OfferCreate transactions on mainnet. They can fill partially, stay open until cancelled, and cost a reserve while open. The bot's own entries/exits use market-style IOC orders and are separate from these.</div>
+</div>
+<div class="pane" data-p="tools">
       <h2><span>Toggles</span></h2><div class="fl" id="toggles"></div>
       <h2><span>Settings copy / paste</span></h2><textarea id="cfgJson" spellcheck="false"></textarea>
       <div class="ctrl" style="margin-top:6px"><button class="sm" id="bExp">Export</button><button class="sm" id="bImp">Import</button></div>
@@ -750,7 +758,7 @@ async function act(name,p={}){try{
   SIM[name](p);render();return{}}catch(e){toast(e.message);return null}}
 let _vw=0;
 async function poll(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)return;S=await r.json();Object.assign(cfg,S.cfg||{});
-  if(MODE==='live'){const f=$('foot');if(f){if(!S.ver||S.ver<2.1)f.innerHTML='<b style="color:#ff8a9a">Your bot files are OUTDATED (no tick store). Re-download the newest TRENDBOT.zip / git pull, replace bot.js, ui.html, config.json and restart.</b>';else if(S.note)f.innerHTML='<b style="color:#ffb84d">'+S.note+'</b>';else if(S.err)f.innerHTML='<b style="color:#ffb84d">Price feed error: '+S.err+'</b> · retrying';else f.textContent='Live · bot v'+S.ver+(S.bid&&S.ask?' · bid '+fp(S.bid)+' / ask '+fp(S.ask):'')+' · '+S.nTicks+' price ticks stored · DEX trades '+(S.dexN||0)+(S.dexErr?' (book_changes: '+String(S.dexErr).slice(0,40)+')':'')+' · last tick '+(S.tickAt?Math.round((Date.now()-S.tickAt)/1000)+'s ago':'—')+' · stops are polled, not on-ledger.'}}
+  if(MODE==='live'){if(S.pairs&&$('pairSel').options.length!==S.pairs.length+1)fillPairs(S.pairs);const f=$('foot');if(f){if(!S.ver||S.ver<2.1)f.innerHTML='<b style="color:#ff8a9a">Your bot files are OUTDATED (no tick store). Re-download the newest TRENDBOT.zip / git pull, replace bot.js, ui.html, config.json and restart.</b>';else if(S.note)f.innerHTML='<b style="color:#ffb84d">'+S.note+'</b>';else if(S.err)f.innerHTML='<b style="color:#ffb84d">Price feed error: '+S.err+'</b> · retrying';else f.textContent='Live · bot v'+S.ver+(S.bid&&S.ask?' · bid '+fp(S.bid)+' / ask '+fp(S.ask):'')+' · '+S.nTicks+' price ticks stored · DEX trades '+(S.dexN||0)+(S.dexErr?' (book_changes: '+String(S.dexErr).slice(0,40)+')':'')+' · last tick '+(S.tickAt?Math.round((Date.now()-S.tickAt)/1000)+'s ago':'—')+' · stops are polled, not on-ledger.'}}
   render()}catch{}}
 
 // ================= canvas helpers =================
@@ -1082,7 +1090,7 @@ function render(){
   if(T.length>=15&&lwr!=null&&lwr<m.wr-20){eb.textContent='EDGE DECAY';eb.className='badge b-am'}else{eb.textContent=T.length<5?'EDGE ?':'EDGE OK';eb.className='badge '+(T.length<5?'b-no':'b-up')}
   // kpis
   const k=(l,v,s,c)=>`<div class="kpi"><div class="l">${l}</div><div class="v ${c||''}">${v}</div><div class="s">${s||''}</div></div>`;
-  const tot=eq-(S.base0||start);$('kpiStrip').innerHTML=k('Equity',f2(eq,2),q)+k('Total P/L',sg(tot,2),sg(tot/(S.base0||start||1)*100)+'%',tot>=0?'pos':'neg')+(fx()?k('P/L $',usd(tot*fx().usd),xrpf(tot*fx().xrp),tot>=0?'pos':'neg'):'')+k('Open P/L',sg(op,op&&Math.abs(op)<1?3:2),p?(sh?'short':'long'):'flat',op>=0?'pos':'neg')+k('Win rate',m.n?f2(m.wr,0)+'%':'—',m.n+' trades')+k('Regime',E?E.name:'—',E?Math.round(E.conf)+'% conf':'')+k('Volatility',E?f2(E.atrPct,2)+'%':'—',E?'ATR · '+f2(E.vr,2)+'× norm':'');
+  const tot=eq-(S.base0||start);$('kpiStrip').innerHTML=k('Equity',f2(eq,2),q+(fx()?' · '+xrpf(eq*fx().xrp)+' · '+usd(eq*fx().usd):''))+k('Total P/L',sg(tot,2),sg(tot/(S.base0||start||1)*100)+'%',tot>=0?'pos':'neg')+(fx()?k('P/L $',usd(tot*fx().usd),xrpf(tot*fx().xrp),tot>=0?'pos':'neg'):'')+k('Open P/L',sg(op,op&&Math.abs(op)<1?3:2),p?(sh?'short':'long'):'flat',op>=0?'pos':'neg')+k('Win rate',m.n?f2(m.wr,0)+'%':'—',m.n+' trades')+k('Regime',E?E.name:'—',E?Math.round(E.conf)+'% conf':'')+k('Volatility',E?f2(E.atrPct,2)+'%':'—',E?'ATR · '+f2(E.vr,2)+'× norm':'');
   $('eqNow').textContent=f2(eq,2)+' '+q;
   {const sc=Math.round(clamp((Math.min(m.pf===Infinity?3:m.pf,3)/3)*40+m.wr*.3+Math.max(0,30-m.mdd*3),0,100)),bh=S.pxStart?(px/S.pxStart-1)*100:null;
    $('kpiStrip').innerHTML+=(S.goal>0?k('Daily goal',sg(S.dayPnlPct||0,2)+'%',S.goalHit?'HIT · stopped':'of +'+S.goal+'%',S.goalHit?'pos':''):k('Today',sg(S.dayPnlPct||0,2)+'%','daily P/L'))+k('Health',m.n<5?'—':sc,'strategy score')+(bh!=null?k('Buy & hold',sg(bh,2)+'%','vs bot '+sg(tot/(S.base0||start||1)*100,2)+'%'):'')}
@@ -1114,9 +1122,16 @@ function drawDD(){const cv=$('ddMini');if(!cv)return;const[x,W,H]=setup(cv);x.cl
   let pk=0;const dd=d.map(v=>{pk=Math.max(pk,v);return(pk-v)/pk*100}),mx=Math.max(...dd,.2),X=i=>i/(d.length-1)*W,Y=v=>6+v/mx*(H-14);
   x.beginPath();x.moveTo(0,6);dd.forEach((v,i)=>x.lineTo(X(i),Y(v)));x.lineTo(W,6);x.closePath();x.fillStyle=lg(x,6,H,[[0,'rgba(255,93,115,.05)'],[1,'rgba(255,93,115,.5)']]);x.fill();x.strokeStyle='#ff5d73';x.lineWidth=1.3;x.stroke();
   x.fillStyle='#8fb0e0';x.font='10px JetBrains Mono';x.fillText('0%',4,16);x.fillText('−'+mx.toFixed(2)+'%',4,H-6);$('ddInfo').textContent='now −'+dd[dd.length-1].toFixed(2)+'% · max −'+mx.toFixed(2)+'%'}
+function ordersUI(){const live=MODE==='live';$('ordPair').textContent=S.pair||'—';
+  $('ordNote').textContent=live?(S.live?'Open offers of the connected wallet on this pair (refreshes every few seconds).':'Connect a wallet on the Wallet page to see and place orders.'):'Simulator: real orders exist only in Live mode.';
+  const o=live&&S.offers?S.offers:[];const act_=document.activeElement&&document.activeElement.closest&&document.activeElement.closest('#ordTbl');if(act_)return;
+  $('ordTbl').innerHTML=o.map(x=>`<tr><td class="${x.side==='BUY'?'pos':'neg'}">${x.side}</td><td>${fp(x.price)}</td><td>${(+x.base).toLocaleString(undefined,{maximumFractionDigits:4})} ${S.baseSym}</td><td>${(+x.quote).toLocaleString(undefined,{maximumFractionDigits:4})} ${S.quoteSym}</td><td><button class="sm" data-oc="${x.seq}">cancel</button></td></tr>`).join('')||'<tr><td colspan="5" class="k">no open orders on this pair</td></tr>';
+  $('ordTbl').querySelectorAll('[data-oc]').forEach(b=>b.onclick=()=>act('cancel',{seq:+b.dataset.oc}).then(r=>r&&toast('Order cancelled',true)));
+  if($('lmPx')&&!$('lmPx').value&&S.px)$('lmPx').placeholder='price ~'+fp(S.px)}
 function paneRender(){
   document.querySelectorAll('.ptab').forEach(b=>b.classList.toggle('on',b.dataset.p===PANEC));document.querySelectorAll('.pane').forEach(p=>p.classList.toggle('on',p.dataset.p===PANEC));
   if(_ap!==S.pair)allocUI();
+  if(PANEC==='orders')ordersUI();
   if($('aSt'))$('aSt').textContent=`Today ${sg(S.dayPnlPct||0,2)}% · ${S.goalHit?'goal hit, trading stopped until tomorrow (or press Resume)':'trading'}`;
   if(PANEC==='smart'){drawEqMini('eqSmart');$('eqSm').textContent=f2(S.eq&&S.eq.length?S.eq[S.eq.length-1]:0,2)+' '+(S.quoteSym||'');$('brainBadge').textContent=S.smart?'SMART ON':'SMART OFF';$('brainBadge').className='badge '+(S.smart?'b-up':'b-no');
     const rg=Object.entries(S.reg||{}).map(([k,v])=>`<div class="zone ${v.r/Math.max(1,v.n)>=0?'g':'r'}"><span>${k}</span><b>${v.n} trades · ${f2(v.w/Math.max(1,v.n)*100,0)}% won · ${sg(v.r/Math.max(1,v.n),2)}R avg</b></div>`).join('')||'<div class="note">Learning: per-regime results appear after trades.</div>';
@@ -1223,7 +1238,10 @@ $('bReset').onclick=()=>{sims[S.pair]=newSim(S.pair);S=sims[S.pair];PLAN=null;AL
 $('bLatest').onclick=()=>{PAN=0;drawChart()};$('zoom').oninput=e=>{VIS=+e.target.value;drawChart()};$('paneSel').onchange=e=>{PANE=e.target.value;drawChart()};
 document.querySelectorAll('.seg').forEach(b=>b.onclick=()=>{scenario=b.dataset.sc;document.querySelectorAll('.seg').forEach(s=>s.classList.toggle('on',s===b));if(S)S.regLeft=0});
 document.querySelectorAll('.th').forEach(b=>b.onclick=()=>setTheme(b.dataset.th));
-$('pairSel').onchange=async e=>{PLAN=null;PAN=0;const r=await act('pair',{id:e.target.value});if(!r)$('pairSel').value=S.pair};
+$('ordCancelAll').onclick=()=>{if(confirm('Cancel ALL open orders on this pair?'))act('cancelall').then(r=>r&&toast('Cancelled '+(r.n||0)+' order(s)',true))};
+$('lmGo').onclick=()=>act('limit',{side:$('lmSide').value,price:+$('lmPx').value,amount:+$('lmAmt').value}).then(r=>{if(r){toast('Limit order placed',true);$('lmAmt').value=''}});
+$('pairSel').onchange=async e=>{if(e.target.value==='__add'){const sym_=(prompt('Token currency code (e.g. BONSAI):')||'').trim();if(!sym_){$('pairSel').value=S.pair;return}const iss=(prompt('Issuer address (starts with r):')||'').trim();if(!iss){$('pairSel').value=S.pair;return}const q=((prompt('Quote asset: XRP or RLUSD','XRP')||'XRP').trim().toUpperCase())==='RLUSD'?'RLUSD':'XRP';const r=await act('addpair',{symbol:sym_,issuer:iss,quote:q});if(r){fillPairs(S.pairs);await act('pair',{id:r.id});$('pairSel').value=S.pair}else $('pairSel').value=S.pair;return}
+  PLAN=null;PAN=0;const r=await act('pair',{id:e.target.value});if(!r)$('pairSel').value=S.pair};
 document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{TAB=t.dataset.tab;document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on',x===t));['trade','analytics','wallet'].forEach(p=>$('pg'+p[0].toUpperCase()+p.slice(1)).classList.toggle('hide',TAB!==p));if(TAB==='wallet'){renderWalletHeader();loadWallet()}render()});
 $('bImport').onclick=async()=>{const seed=$('seedIn').value.trim();if(!seed)return toast('Paste a family seed');const r=await act('import',{seed});$('seedIn').value='';if(r){toast('Wallet connected',true);loadWallet()}};
 $('bDisc').onclick=async()=>{await act('disconnect');WALLET=null;renderWalletHeader()};$('bWRefresh').onclick=loadWallet;
@@ -1232,7 +1250,7 @@ $('bCsv').onclick=()=>{const T=NT(),csv='n,side,entry,exit,pnl,r,reason,bars\n'+
   try{navigator.clipboard.writeText(csv).then(()=>toast('CSV copied',true),()=>toast('Clipboard blocked here'))}catch{toast('Clipboard blocked here')}};
 document.addEventListener('keydown',e=>{if(/INPUT|SELECT|TEXTAREA/.test(e.target.tagName)||e.metaKey||e.ctrlKey)return;const k=e.key.toLowerCase();
   if(k==='b')planL();else if(k==='s')planS();else if(k==='a')addAlert();else if(k==='escape'){PLAN=null;render()}else if(k==='enter'&&PLAN)$('bConfirm').click();else if(k===' '&&MODE==='sim'){e.preventDefault();$('bPlay').click()}else if(k==='l'){PAN=0;drawChart()}});
-function fillPairs(list){$('pairSel').innerHTML=list.map(i=>`<option>${i}</option>`).join('');if(S&&S.pair)$('pairSel').value=S.pair}
+function fillPairs(list){$('pairSel').innerHTML=list.map(i=>`<option>${i}</option>`).join('')+(MODE==='live'?'<option value="__add">+ Add token pair…</option>':'');if(S&&S.pair)$('pairSel').value=S.pair}
 // ================= extra wiring =================
 const PRESETS={Conservative:{maxStopPct:1.5,riskPerTradePct:.5,takeProfitR:2,trailMode:'structure',autoBE:true,minER:.25,tpLadder:[{r:1,pct:50}],maxTradesPerDay:6,cooldownCandles:2,givebackPct:0},
  Balanced:{maxStopPct:3,riskPerTradePct:1,takeProfitR:2,trailMode:'structure',autoBE:true,minER:0,tpLadder:[],maxTradesPerDay:0,cooldownCandles:1,givebackPct:0,timeStopBars:0},
