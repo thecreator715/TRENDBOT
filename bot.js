@@ -86,14 +86,27 @@ async function ammInfo(p) {
   const [bs, qs] = a.cur === p.base.currency ? [a, b] : [b, a];
   return { spot: qs.v / bs.v, fee: (r.result.amm.trading_fee || 0) / 100000 };
 }
+// Depth-weighted book price: a dust offer on top must not set the price, so average across offers until REF units of the quote are covered.
+function walk(offers, getsIsBase, ref) {
+  let g = 0, pz = 0;
+  for (const o of offers) {
+    const G = amt(o.taker_gets_funded || o.TakerGets), Pz = amt(o.taker_pays_funded || o.TakerPays);
+    if (!(G.v > 0 && Pz.v > 0)) continue;
+    const quoteSide = getsIsBase ? Pz.v : G.v, have = getsIsBase ? pz : g, take = Math.min(1, Math.max(0, (ref - have) / quoteSide));
+    if (take <= 0) break; g += G.v * take; pz += Pz.v * take;
+    if ((getsIsBase ? pz : g) >= ref * 0.999) break;
+  }
+  if (!(g > 0 && pz > 0)) return null;
+  return getsIsBase ? pz / g : g / pz; // quote per base
+}
 async function bookBest(p) {
-  const bx = isXRP(p.base) ? 1e6 : 1, qx = isXRP(p.quote) ? 1e6 : 1;
+  const ref = Math.max(cfg.priceRefQuote || 100, 1);
   const [asks, bids] = await Promise.all([
-    client.request({ command: 'book_offers', taker_gets: asset(p.base), taker_pays: asset(p.quote), limit: 1 }),
-    client.request({ command: 'book_offers', taker_gets: asset(p.quote), taker_pays: asset(p.base), limit: 1 }),
+    client.request({ command: 'book_offers', taker_gets: asset(p.base), taker_pays: asset(p.quote), limit: 20 }),
+    client.request({ command: 'book_offers', taker_gets: asset(p.quote), taker_pays: asset(p.base), limit: 20 }),
   ]);
-  const a = asks.result.offers[0], b = bids.result.offers[0];
-  return { ask: a ? (Number(a.quality) * bx) / qx : null, bid: b ? 1 / ((Number(b.quality) * qx) / bx) : null };
+  const a = asks.result.offers, b = bids.result.offers;
+  return { ask: walk(a, true, ref), bid: walk(b, false, ref), nA: a.length, nB: b.length };
 }
 // Real DEX trades: book_changes returns per-ledger OHLC for every book (AMM + order book fills). Used to catch wicks between polls.
 // Field formats vary by server, so every candidate scaling is checked against the executable mid and only accepted within 5%.
@@ -124,7 +137,7 @@ async function price() {
   if (A && B && B.ask && B.bid) { const m = (B.ask + B.bid) / 2; if (Math.abs(A.spot - m) / A.spot > 0.05) throw new Error(`AMM ${A.spot} and book ${m} disagree >5%, skipping tick`); }
   let v = ask && bid && bid < ask ? (ask + bid) / 2 : (A ? A.spot : (ask || bid));
   if (!v || !isFinite(v)) throw new Error('no price for ' + pair.id);
-  last.ask = ask; last.bid = bid;
+  last.ask = ask; last.bid = bid; last.src = { amm: A ? A.spot : null, bookAsk: B ? B.ask : null, bookBid: B ? B.bid : null, nA: B ? B.nA : 0, nB: B ? B.nB : 0 };
   return v;
 }
 async function walletData() {
@@ -362,7 +375,7 @@ const equityOf = (b, px) => b.quote + b.base * px;
 async function tick() {
   if (busy) return; busy = true;
   try {
-    const px = await price(); last.px = px; last.err = null; last.at = Date.now();
+    const px = await price(); last.px = px; last.err = null; last.at = Date.now(); errRun = 0;
     const now = Date.now();
     try { await dexWicks(pair, px); } catch (e) { last.dexErr = e.message; }
     P.ticks.push([now, px]);
@@ -415,7 +428,7 @@ async function tick() {
       }
     }
     save();
-  } catch (err) { last.err = err.message; log('tick error:', err.message); }
+  } catch (err) { last.err = err.message; log('tick error:', err.message); if (!MOCK && ++errRun >= 4) rotateServer(); }
   finally { busy = false; }
 }
 async function locked(fn) { while (busy) await sleep(60); busy = true; try { return await fn(); } finally { busy = false; } }
@@ -425,7 +438,7 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    ver: 2.1, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 2.1, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
@@ -551,11 +564,31 @@ const server = http.createServer(async (req, res) => {
   } catch (e) { send(400, { error: e.message }); }
 });
 
+const SERVERS = () => [...new Set([process.env.TB_SERVER || cfg.server, ...(process.env.TB_SERVER ? [] : ['wss://xrplcluster.com', 'wss://s1.ripple.com', 'wss://s2.ripple.com'])])];
+let srvIdx = 0, errRun = 0, rotating = false;
+async function connectClient(i) {
+  const list = SERVERS(); srvIdx = i % list.length; const url = list[srvIdx];
+  const old = client; client = null; if (old) { try { old.removeAllListeners(); await old.disconnect(); } catch {} }
+  const c = new xrpl.Client(url, { timeout: 15000 });
+  c.on('disconnected', () => log('disconnected from', url));
+  c.on('ledgerClosed', l => { last.ledger = l.ledger_index; last.ledgerAt = Date.now(); tick(); }); // re-price on every validated ledger (~3-4s)
+  await c.connect(); client = c; last.server = url;
+  try { await c.request({ command: 'subscribe', streams: ['ledger'] }); } catch (e) { log('ledger subscribe failed:', e.message); }
+  log('connected to', url);
+}
+async function rotateServer() {
+  if (rotating) return; rotating = true;
+  try { await connectClient(srvIdx + 1); errRun = 0; } catch (e) { log('server switch failed:', e.message); } finally { rotating = false; }
+}
+// Independent reference price (Bitstamp XRP/USD, RLUSD ~ $1): only flags a bad feed, never traded on.
+async function refPrice() {
+  try { const r = await fetch('https://www.bitstamp.net/api/v2/ticker/xrpusd/'); const j = await r.json(); last.ref = Number(j.last); last.refAt = Date.now(); } catch (e) { last.refErr = e.message; }
+}
 async function main() {
   if (process.env.BOT_SEED) { wallet = xrpl.Wallet.fromSeed(process.env.BOT_SEED.trim()); delete process.env.BOT_SEED; }
   loadPair();
-  if (!MOCK) { client = new xrpl.Client(process.env.TB_SERVER || cfg.server); client.on('disconnected', () => log('disconnected, reconnecting')); await client.connect(); }
+  if (!MOCK) await connectClient(0);
   server.listen(PORT, '127.0.0.1', () => log(`TRENDBOT UI: http://127.0.0.1:${PORT} | ${wallet ? 'LIVE ' + wallet.address : 'PAPER (import a wallet on the Wallet page for live)'}${MOCK ? ' | MOCK PRICES' : ''}`));
-  setInterval(tick, cfg.pollSeconds * 1000); tick();
+  setInterval(tick, cfg.pollSeconds * 1000); tick(); refPrice(); setInterval(refPrice, 10000);
 }
 main().catch(e => { console.error(e); process.exit(1); });
