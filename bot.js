@@ -95,6 +95,22 @@ async function bookBest(p) {
   const a = asks.result.offers[0], b = bids.result.offers[0];
   return { ask: a ? (Number(a.quality) * bx) / qx : null, bid: b ? 1 / ((Number(b.quality) * qx) / bx) : null };
 }
+// Real DEX trades: book_changes returns per-ledger OHLC for every book (AMM + order book fills). Used to catch wicks between polls.
+// Field formats vary by server, so every candidate scaling is checked against the executable mid and only accepted within 5%.
+async function dexWicks(p, mid) {
+  if (MOCK || !client) return;
+  const r = await client.request({ command: 'book_changes', ledger_index: 'validated' });
+  const L = r.result.ledger_index; if (L === last.bcLedger) return; last.bcLedger = L;
+  const want = [p.base, p.quote].map(a => isXRP(a) ? 'XRP' : a.issuer);
+  const e = (r.result.changes || []).find(c => { const k = String(c.currency_a) + '|' + String(c.currency_b); return want.every(w => k.includes(w)); });
+  if (!e) return;
+  const near = v => { for (const f of [x => x, x => 1 / x, x => x * 1e6, x => x / 1e6, x => 1e6 / x, x => 1 / x / 1e6]) { const y = f(+v); if (isFinite(y) && y > 0 && Math.abs(y - mid) / mid < 0.05) return y; } return null; };
+  const hi = near(e.high), lo = near(e.low), cl = near(e.close);
+  const vals = [lo, hi, cl].filter(v => v), now = Date.now();
+  if (!vals.length) return;
+  for (const v of vals) { P.ticks.push([now, v]); candles.push(now, v); }
+  last.dexVol = e.volume_a || e.volume_b || null; last.dexAt = now; last.dexN = (last.dexN || 0) + 1;
+}
 let mockPx = {};
 // Executable mid: best ask = min(book ask, AMM ask), best bid = max(book bid, AMM bid). Moves with every book update, not just AMM swaps.
 async function price() {
@@ -227,6 +243,7 @@ async function tick() {
   try {
     const px = await price(); last.px = px; last.err = null; last.at = Date.now();
     const now = Date.now();
+    try { await dexWicks(pair, px); } catch (e) { last.dexErr = e.message; }
     P.ticks.push([now, px]);
     const closedNow = candles.push(now, px);
     const b = (Date.now() - balAt < 8000 && balC) ? balC : await balances(); balC = b; balAt = Date.now();
@@ -275,7 +292,7 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    ver: 2.1, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 2.1, dexN: last.dexN || 0, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
