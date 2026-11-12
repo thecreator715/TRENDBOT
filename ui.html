@@ -1126,7 +1126,7 @@ function drawDD(){const cv=$('ddMini');if(!cv)return;const[x,W,H]=setup(cv);x.cl
   x.fillStyle='#8fb0e0';x.font='10px JetBrains Mono';x.fillText('0%',4,16);x.fillText('−'+mx.toFixed(2)+'%',4,H-6);$('ddInfo').textContent='now −'+dd[dd.length-1].toFixed(2)+'% · max −'+mx.toFixed(2)+'%'}
 function autoOrdUI(){const el=$('autoOrd');if(!el||el.dataset.b||MODE!=='live')return;el.dataset.b=1;
   const R=[['limitSpreadFrac','Start at (0 = bid, 1 = ask)',0,1,.05,''],['limitTimeoutSec','Give up / fall back after',10,180,5,'s'],['limitChasePct','Cancel if price runs away',.05,1.5,.05,'%'],['slPct','Auto stop-loss (0 = structure)',0,5,.1,'%'],['tpPct','Auto take-profit (0 = R-multiple)',0,10,.1,'%']];
-  const T=[['limitFallback','Market fallback on timeout'],['tpLimit','Take-profit rests on the book'],['flipReverse','Flip long⇄short instantly']];
+  const T=[['alwaysIn','Always in a trade (long or short)'],['limitFallback','Market fallback on timeout'],['tpLimit','Take-profit rests on the book'],['flipReverse','Flip long⇄short instantly']];
   el.innerHTML='<div class="slider"><label>Entry orders</label><select id="aoMode" style="width:100%"><option value="limit">Automatic limit (rests on book, walks to market)</option><option value="market">Market (immediate-or-cancel)</option></select></div>'
    +R.map(([k,l,a,b,st,uu])=>`<div class="slider"><label>${l}<b id="ao_${k}">${cfg[k]??0}${uu}</b></label><input type="range" min="${a}" max="${b}" step="${st}" value="${cfg[k]??0}" data-ao="${k}" data-u="${uu}"></div>`).join('')
    +'<div class="ctrl" style="flex-wrap:wrap">'+T.map(([k,l])=>`<button class="chip ${cfg[k]?'on':''}" data-aot="${k}">${l}</button>`).join('')+'</div>';

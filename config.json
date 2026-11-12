@@ -30,5 +30,5 @@
   "tpPct": 0,
   "autoShort": true,
   "flipReverse": true,
-  "priceRefQuote": 100, "limitRepriceSec": 4
+  "alwaysIn": true, "alwaysInLongOnDown": false, "priceRefQuote": 100, "limitRepriceSec": 4
 }

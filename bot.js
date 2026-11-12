@@ -425,6 +425,18 @@ async function tick() {
             if (qty * px >= cfg.minTradeQuote) await enter(false, px, A.stop, A.target, qty, ss.why);
           } else if (!sig.enter && sig.trend !== 'UP') last.sig = { ...sig, why: sig.why + ' · short: ' + ss.why };
         }
+        // ALWAYS-IN-MARKET: if no breakout signal fired and we're flat, take the side the trend favours right now (same candle-structure stop/target).
+        if (cfg.alwaysIn && !P.pos && !P.pend && !state.halted && Date.now() >= P.cooldownUntil && last.plan) {
+          const cl = candles.closed, c2 = cl[cl.length - 1], up = sig.trend === 'UP' ? true : sig.trend === 'DOWN' ? false : px >= c2.close;
+          const can = (long) => { const lv = long ? last.plan.long : last.plan.short, A = autoLv({ stop: lv.stop, target: lv.target, stopPct: 0 }, px, long), u = useFrac(), rs = S.riskScale(P.consec, cfg);
+            const q = long ? S.sizeQuote(e * u, Math.min(b.quote, e * u), A.stopPct, cfg, rs) : S.sizeShortBase(e * u, px, A.stop, b.base, cfg, rs);
+            return { A, q, ok: long ? q >= cfg.minTradeQuote : q * px >= cfg.minTradeQuote }; };
+          const L = can(true), Sh = state.shortOn ? can(false) : { ok: false };
+          if (up && L.ok) await enter(true, px, L.A.stop, L.A.target, L.q, 'always-in: trend UP');
+          else if (!up && Sh.ok) await enter(false, px, Sh.A.stop, Sh.A.target, Sh.q, 'always-in: trend DOWN');
+          else if (!up && !state.shortOn && L.ok && cfg.alwaysInLongOnDown) await enter(true, px, L.A.stop, L.A.target, L.q, 'always-in: long (shorts off)');
+          else if (Date.now() - (last.noteAt || 0) > 60000) { last.noteAt = Date.now(); addLog('info', `always-in waiting: trend ${up ? 'UP' : 'DOWN'}, ${up ? 'long size too small' : state.shortOn ? 'short unavailable (needs XRP above reserve)' : 'shorts are OFF'}`); }
+        }
       }
     }
     save();
