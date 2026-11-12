@@ -4,8 +4,8 @@
     "currency": "524C555344000000000000000000000000000000",
     "issuer": "rMxCKbEDwqr76QuheSUMdEGf4B9xJ8m5De"
   },
-  "timeframeMinutes": 60,
-  "pollSeconds": 15,
+  "timeframeMinutes": 5,
+  "pollSeconds": 5,
   "stopBufferPct": 0.15,
   "maxStopPct": 3,
   "takeProfitR": 2,

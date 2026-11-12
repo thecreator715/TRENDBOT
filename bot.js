@@ -44,10 +44,31 @@ const addLog = (type, msg) => { logs.unshift({ type, msg, time: Date.now() }); i
 
 function loadPair() {
   P = state.pairs[pair.id] ||= { closed: [], cur: null, pos: null, cooldownUntil: 0, consec: 0, paper: { base: 0, quote: 1000 } };
-  candles = new S.Candles(cfg.timeframeMinutes, P.closed, P.cur);
+  P.ticks ||= [];
+  candles = P.ticks.length > 2 ? S.buildCandles(P.ticks, cfg.timeframeMinutes) : new S.Candles(cfg.timeframeMinutes, P.closed, P.cur);
   eq.length = 0; startEq = null;
+  if (typeof backfill === 'function' && client !== undefined) backfill();
+}
+// Seed the chart with ~16h of 1-minute history (XRP/USD, Bitstamp public API) so it isn't empty at start. XRP/RLUSD only; other pairs build live from ticks.
+async function backfill() {
+  const P0 = P, pid = pair.id;
+  if (MOCK || pid !== 'XRP/RLUSD' || P0.ticks.length > 200) return;
+  try {
+    const r = await fetch('https://www.bitstamp.net/api/v2/ohlc/xrpusd/?step=60&limit=1000');
+    const j = await r.json(), bars = (j.data && j.data.ohlc) || [];
+    const first = P0.ticks.length ? P0.ticks[0][0] : Infinity, h = [];
+    for (const b of bars) {
+      const t = +b.timestamp * 1000; if (t >= first) continue;
+      const o = +b.open, hi = +b.high, lo = +b.low, c = +b.close, up = c >= o;
+      h.push([t, o], [t + 15000, up ? lo : hi], [t + 30000, up ? hi : lo], [t + 45000, c]);
+    }
+    if (h.length < 100 || P !== P0) return;
+    P0.ticks = h.concat(P0.ticks); candles = S.buildCandles(P0.ticks, cfg.timeframeMinutes);
+    addLog('info', `chart seeded with ${bars.length} minutes of XRP history`);
+  } catch (e) { log('history backfill skipped:', e.message); }
 }
 function save() {
+  if (P.ticks.length > 8000) P.ticks.splice(0, P.ticks.length - 6000);
   P.closed = candles.closed; P.cur = candles.cur; state.pairId = pair.id;
   fs.writeFileSync(F('state.json') + '.tmp', JSON.stringify(state));
   fs.renameSync(F('state.json') + '.tmp', F('state.json'));
@@ -201,6 +222,7 @@ async function tick() {
   try {
     const px = await price(); last.px = px; last.err = null;
     const now = Date.now();
+    P.ticks.push([now, px]);
     const closedNow = candles.push(now, px);
     const b = await balances();
     const e = equityOf(b, px);
@@ -243,7 +265,7 @@ async function locked(fn) { while (busy) await sleep(60); busy = true; try { ret
 
 // ---------- API ----------
 const view = () => {
-  const cs = candles.closed.slice(-60);
+  const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
     live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
@@ -316,6 +338,16 @@ const routes = {
     }
     return {};
   },
+  'POST /api/tf': async (b) => locked(async () => {
+    const m = Math.round(+b.minutes); if (!(m >= 1 && m <= 1440)) throw new Error('bad timeframe');
+    cfg.timeframeMinutes = m; candles = S.buildCandles(P.ticks, m);
+    if (P.pos) P.pos.entryCandleT = candles.cur ? candles.cur.t : P.pos.entryCandleT;
+    P.marks = []; save(); addLog('info', `timeframe ${m}m · rebuilt ${candles.closed.length} candles from ${P.ticks.length} live ticks`); return {};
+  }),
+  'POST /api/flatten': async () => locked(async () => { if (!P.pos) return {}; const px = await price(); if (!(await closePos(px, 'flatten', cfg.stopSlippagePct))) throw new Error('Order not filled'); save(); return {}; }),
+  'POST /api/take': async (b) => locked(async () => { if (!P.pos) throw new Error('No open position'); const px = await price(); const f = Math.min(1, Math.max(0.05, +b.frac || 0.5)); if (!(await closePos(px, 'take profit', cfg.entrySlippagePct, f))) throw new Error('Order not filled'); save(); return {}; }),
+  'POST /api/hedge': async () => { throw new Error('Hedge (long+short) is simulator-only for now'); },
+  'POST /api/smart': async () => { throw new Error('Smart Auto is simulator-only for now'); },
   'POST /api/alloc': async (b) => { if (b.use != null) P.use = Math.min(100, Math.max(5, +b.use || 100)); if (b.goal != null) P.goal = Math.min(50, Math.max(0, +b.goal || 0)); save(); return { use: P.use ?? 100, goal: P.goal || 0 }; },
 };
 
