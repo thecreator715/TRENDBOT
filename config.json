@@ -19,7 +19,7 @@
   "cooldownCandles": 1,
   "minTradeQuote": 1e-06,
   "uiPort": 8787,
-  "shortInventoryPct": 50,
+  "shortInventoryPct": 100,
   "entryMode": "limit",
   "limitSpreadFrac": 0.3,
   "limitTimeoutSec": 40,

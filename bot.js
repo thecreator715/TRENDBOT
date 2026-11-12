@@ -509,7 +509,7 @@ const routes = {
     const px = await price(), stop = num(b.stop, 'stop'); if (stop <= px) throw new Error('Short stop must be above the price');
     const target = b.target ? num(b.target, 'target') : null; if (target && target >= px) throw new Error('Short target must be below the price');
     const bal = await balances(), e = equityOf(bal, px), qty = S.sizeShortBase(e * useFrac(), px, stop, bal.base, cfg);
-    if (qty * px < cfg.minTradeQuote) throw new Error('Not enough base inventory to short at these risk settings');
+    if (!(qty * px >= cfg.minTradeQuote)) throw new Error(`No ${sym(pair.base.currency)} to short: spendable ${bal.base.toFixed(6)} (XRP below the account reserve + ${cfg.xrpReserveBuffer} fee buffer can't be sold). Send some ${sym(pair.base.currency)} to the wallet.`);
     if (!(await openShort(px, stop, target, qty, 'manual'))) throw new Error('Order not filled');
     P.pos.userStop = true; save(); return {};
   }),

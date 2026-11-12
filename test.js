@@ -78,7 +78,7 @@ assert.strictEqual(S.manageShort({ ...sh }, 1.79, [c(0, 1.9, 2.1), c(1, 1.8, 1.9
 const trd = S.manageShort({ ...sh }, 1.9, [c(1, 1.8, 1.95), c(2, 1.75, 1.9)], { ...cfg, autoBE: false }); assert.ok(trd.stop < 1.95 && !trd.exit, 'short trail down');
 assert.strictEqual(S.manageShort({ stop: 3, stop0: 3, entry: 2, target: null, entryCandleT: 1 }, 1.9, [c(1, 1.8, 1.95), c(2, 1.85, 2.0)], cfg).reason, 'trend-flip');
 const stS = { ...sh }; assert.ok(S.manageShort(stS, 1.93, [], { ...cfg, trailMode: 'step', autoBE: false }).stop < 2.0, 'short step trail');
-assert.ok(S.sizeShortBase(1000, 2, 2.04, 100, cfg) <= 50);
+assert.ok(S.sizeShortBase(1000, 2, 2.04, 100, { ...cfg, shortInventoryPct: 50 }) <= 50);
 
 // aggregate (HTF) + candle building from ticks
 const base = []; for (let i = 0; i < 12; i++) base.push({ t: i, open: 1 + i * .01, high: 1.02 + i * .01, low: .98 + i * .01, close: 1.01 + i * .01 });
