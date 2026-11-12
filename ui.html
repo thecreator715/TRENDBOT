@@ -750,7 +750,7 @@ async function act(name,p={}){try{
   SIM[name](p);render();return{}}catch(e){toast(e.message);return null}}
 let _vw=0;
 async function poll(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)return;S=await r.json();Object.assign(cfg,S.cfg||{});
-  if(MODE==='live'){const f=$('foot');if(f){if(!S.ver||S.ver<2.1)f.innerHTML='<b style="color:#ff8a9a">Your bot files are OUTDATED (no tick store). Re-download the newest TRENDBOT.zip / git pull, replace bot.js, ui.html, config.json and restart.</b>';else if(S.note)f.innerHTML='<b style="color:#ffb84d">'+S.note+'</b>';else if(S.err)f.innerHTML='<b style="color:#ffb84d">Price feed error: '+S.err+'</b> · retrying';else f.textContent='Live · bot v'+S.ver+' · '+S.nTicks+' price ticks stored · last tick '+(S.tickAt?Math.round((Date.now()-S.tickAt)/1000)+'s ago':'—')+' · stops are polled, not on-ledger.'}}
+  if(MODE==='live'){const f=$('foot');if(f){if(!S.ver||S.ver<2.1)f.innerHTML='<b style="color:#ff8a9a">Your bot files are OUTDATED (no tick store). Re-download the newest TRENDBOT.zip / git pull, replace bot.js, ui.html, config.json and restart.</b>';else if(S.note)f.innerHTML='<b style="color:#ffb84d">'+S.note+'</b>';else if(S.err)f.innerHTML='<b style="color:#ffb84d">Price feed error: '+S.err+'</b> · retrying';else f.textContent='Live · bot v'+S.ver+(S.bid&&S.ask?' · bid '+fp(S.bid)+' / ask '+fp(S.ask):'')+' · '+S.nTicks+' price ticks stored · last tick '+(S.tickAt?Math.round((Date.now()-S.tickAt)/1000)+'s ago':'—')+' · stops are polled, not on-ledger.'}}
   render()}catch{}}
 
 // ================= canvas helpers =================

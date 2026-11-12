@@ -80,32 +80,35 @@ function logTrade(row) {
 
 // ---------- ledger reads ----------
 const amt = x => (typeof x === 'string' ? { cur: 'XRP', v: Number(x) / 1e6 } : { cur: x.currency, v: Number(x.value) });
-async function ammPrice(p) {
+async function ammInfo(p) {
   const r = await client.request({ command: 'amm_info', asset: asset(p.base), asset2: asset(p.quote) });
   const a = amt(r.result.amm.amount), b = amt(r.result.amm.amount2);
   const [bs, qs] = a.cur === p.base.currency ? [a, b] : [b, a];
-  return qs.v / bs.v;
+  return { spot: qs.v / bs.v, fee: (r.result.amm.trading_fee || 0) / 100000 };
 }
-async function bookMid(p) {
+async function bookBest(p) {
   const bx = isXRP(p.base) ? 1e6 : 1, qx = isXRP(p.quote) ? 1e6 : 1;
   const [asks, bids] = await Promise.all([
     client.request({ command: 'book_offers', taker_gets: asset(p.base), taker_pays: asset(p.quote), limit: 1 }),
     client.request({ command: 'book_offers', taker_gets: asset(p.quote), taker_pays: asset(p.base), limit: 1 }),
   ]);
   const a = asks.result.offers[0], b = bids.result.offers[0];
-  if (!a || !b) return null;
-  const ask = (Number(a.quality) * bx) / qx;
-  const bid = 1 / ((Number(b.quality) * qx) / bx);
-  return (ask + bid) / 2;
+  return { ask: a ? (Number(a.quality) * bx) / qx : null, bid: b ? 1 / ((Number(b.quality) * qx) / bx) : null };
 }
 let mockPx = {};
+// Executable mid: best ask = min(book ask, AMM ask), best bid = max(book bid, AMM bid). Moves with every book update, not just AMM swaps.
 async function price() {
   if (MOCK) { mockPx[pair.id] = (mockPx[pair.id] || 2) * (1 + (Math.random() - 0.495) * 0.004); return mockPx[pair.id]; }
-  const [amm, mid] = await Promise.allSettled([ammPrice(pair), bookMid(pair)]);
-  const a = amm.status === 'fulfilled' ? amm.value : null, m = mid.status === 'fulfilled' ? mid.value : null;
-  if (a && m && Math.abs(a - m) / a > 0.02) throw new Error(`AMM ${a} and book ${m} disagree >2%, skipping tick`);
-  const v = a || m;
+  const [amm, bk] = await Promise.allSettled([ammInfo(pair), bookBest(pair)]);
+  const A = amm.status === 'fulfilled' ? amm.value : null, B = bk.status === 'fulfilled' ? bk.value : null;
+  let ask = null, bid = null;
+  if (A) { ask = A.spot / (1 - A.fee); bid = A.spot * (1 - A.fee); }
+  if (B && B.ask) ask = ask ? Math.min(ask, B.ask) : B.ask;
+  if (B && B.bid) bid = bid ? Math.max(bid, B.bid) : B.bid;
+  if (A && B && B.ask && B.bid) { const m = (B.ask + B.bid) / 2; if (Math.abs(A.spot - m) / A.spot > 0.05) throw new Error(`AMM ${A.spot} and book ${m} disagree >5%, skipping tick`); }
+  let v = ask && bid && bid < ask ? (ask + bid) / 2 : (A ? A.spot : (ask || bid));
   if (!v || !isFinite(v)) throw new Error('no price for ' + pair.id);
+  last.ask = ask; last.bid = bid;
   return v;
 }
 async function walletData() {
@@ -272,7 +275,7 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    ver: 2.1, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 2.1, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
