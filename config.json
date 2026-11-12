@@ -33,5 +33,7 @@
   "alwaysIn": true,
   "alwaysInLongOnDown": false,
   "priceRefQuote": 100,
-  "limitRepriceSec": 4
+  "limitRepriceSec": 4,
+  "runForever": true,
+  "hardFloorPct": 50
 }

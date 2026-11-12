@@ -356,7 +356,7 @@ async function manageTp(px) {
 // ---------- strategy context / allocation ----------
 const mkCtx = () => S.ctxFrom(candles.closed, S.aggregate(candles.closed, candles.cur, cfg.htfMult || 4), { tradesToday: P.tradesToday || 0 });
 const useFrac = () => Math.min(1, Math.max(0.05, (P.use ?? 100) / 100));
-let prevB = null, walC = null, walAt = 0, walTxC = [], walTxAt = 0, balC = null, balAt = 0, offC = [], offAt = 0, xuC = null, xuAt = 0;
+let runStartEq = null, prevB = null, walC = null, walAt = 0, walTxC = [], walTxAt = 0, balC = null, balAt = 0, offC = [], offAt = 0, xuC = null, xuAt = 0;
 const amtOf = x => (typeof x === 'string' ? { cur: 'XRP', v: Number(x) / 1e6, iss: null } : { cur: x.currency, v: Number(x.value), iss: x.issuer });
 const isAsset = (x, a) => (isXRP(a) ? x.cur === 'XRP' : x.cur === a.currency && x.iss === a.issuer);
 async function refreshOffers(force) {
@@ -389,10 +389,11 @@ async function tick() {
     if (wallet && !MOCK && Date.now() - walTxAt > 20000) { walTxAt = Date.now(); walletTx().then(t => { walTxC = t; }).catch(() => {}); }
     const e = equityOf(b, px);
     if (startEq == null) startEq = e;
+    if (runStartEq == null) runStartEq = e;
     // external deposit/withdrawal (not a trade): shift the day's baseline by the flow so it is not read as a trading gain or loss
     if (wallet && prevB && !prevB.busy && !(P.pos || P.pend) && prevB.tr === state.trades.length && prevB.pid === pair.id) {
       const flow = (b.quote - prevB.b.quote) + (b.base - prevB.b.base) * px;
-      if (Math.abs(flow) > Math.max(cfg.minTradeQuote, 0.01 * Math.max(e, 1e-9))) { startEq += flow; if (startEq < 0) startEq = 0; addLog('info', `Deposit/withdrawal detected: ${flow >= 0 ? '+' : ''}${flow.toFixed(4)} ${sym(pair.quote.currency)}. Baseline adjusted, P/L unchanged.`); }
+      if (Math.abs(flow) > Math.max(cfg.minTradeQuote, 0.01 * Math.max(e, 1e-9))) { startEq += flow; runStartEq += flow; if (startEq < 0) startEq = 0; if (runStartEq < 0) runStartEq = 0; addLog('info', `Deposit/withdrawal detected: ${flow >= 0 ? '+' : ''}${flow.toFixed(4)} ${sym(pair.quote.currency)}. Baseline adjusted, P/L unchanged.`); }
     }
     prevB = { b: { ...b }, busy: !!(P.pos || P.pend), tr: state.trades.length, pid: pair.id };
     if (walC) { const tot = a => isXRP(a) ? walC.xrp : ((walC.lines.find(x => x.raw === a.currency && x.issuer === a.issuer) || {}).balance || 0); last.eqAll = tot(pair.quote) + tot(pair.base) * px; last.xrpTotal = walC.xrp; }
@@ -409,8 +410,10 @@ async function tick() {
     last.plan = (() => { const cl = candles.closed; if (cl.length < 2) return null; const c2 = cl[cl.length - 1], bf = cfg.stopBufferPct / 100, mx = cfg.maxStopPct / 100, R = Math.max(cfg.takeProfitR || 2, 1.5);
       const ls = Math.max(c2.low * (1 - bf), c2.high * (1 - mx)), ss2 = Math.min(c2.high * (1 + bf), c2.low * (1 + mx));
       return { long: { trigger: c2.high, stop: ls, target: c2.high + (c2.high - ls) * R }, short: { trigger: c2.low, stop: ss2, target: c2.low - (ss2 - c2.low) * R }, shortsOn: !!state.shortOn }; })();
+    if (P.goal > 0 && !P.goalHit && startEq && tradePnlPct >= P.goal && cfg.runForever) { P.goalHit = true; addLog('buy', `Daily goal +${P.goal}% reached: run-forever is ON, so trading continues`); }
     if (P.goal > 0 && !P.goalHit && startEq && tradePnlPct >= P.goal) { P.goalHit = true; state.halted = `daily goal +${P.goal}% reached`; addLog('buy', 'DAILY GOAL reached: flattening, resumes tomorrow'); }
     if (state.halted && /^daily loss/.test(state.halted) && -tradePnlPct < cfg.dailyLossHaltPct) { addLog('info', `Daily-loss halt cleared: loss is now ${(-tradePnlPct).toFixed(2)}% (under ${cfg.dailyLossHaltPct}%)`); state.halted = null; }
+    if (cfg.hardFloorPct > 0 && runStartEq > 0 && !state.halted && e < runStartEq * (1 - cfg.hardFloorPct / 100)) { state.halted = `hard floor: equity down ${cfg.hardFloorPct}% from the run start`; addLog('loss', 'HALT ' + state.halted + ' (press Resume to continue)'); }
     const halt = fs.existsSync(F('STOP')) ? 'STOP file present' : state.halted;
     if (P.pos && !(P.pos.base > 1e-9)) { addLog('info', 'cleared empty position record'); P.pos = null; }
     if (P.pend) await handlePend(px, halt);
@@ -426,7 +429,9 @@ async function tick() {
       if (closedNow) addLog('info', `candle closed H ${closedNow.high.toPrecision(6)} L ${closedNow.low.toPrecision(6)} | ${sig.why}`);
       if (!halt && state.autoOn) {
         const dd = -tradePnlPct;
-        if (dd >= cfg.dailyLossHaltPct) { state.halted = `daily loss ${dd.toFixed(2)}% hit limit`; addLog('loss', 'HALT ' + state.halted); }
+        if (cfg.runForever && dd >= cfg.dailyLossHaltPct) { P.cooldownUntil = now + Math.max(3, cfg.cooldownCandles * 3) * cfg.timeframeMinutes * 60000; addLog('loss', `Daily loss ${dd.toFixed(2)}% hit the limit: run-forever pauses ${Math.max(3, cfg.cooldownCandles * 3)} candles, resets the day's baseline and continues`); startEq = e; P.dayPnl = 0; }
+        else if (cfg.runForever && P.consec >= cfg.maxConsecutiveLosses) { P.cooldownUntil = now + 3 * cfg.timeframeMinutes * 60000; P.consec = Math.max(0, cfg.maxConsecutiveLosses - 1); addLog('loss', `${cfg.maxConsecutiveLosses} losses in a row: run-forever pauses 3 candles (size stays reduced) and continues`); }
+        else if (dd >= cfg.dailyLossHaltPct) { state.halted = `daily loss ${dd.toFixed(2)}% hit limit`; addLog('loss', 'HALT ' + state.halted); }
         else if (P.consec >= cfg.maxConsecutiveLosses) { state.halted = `${P.consec} losses in a row`; addLog('loss', 'HALT ' + state.halted); }
         else if (now >= P.cooldownUntil && sig.enter) {
           const A = autoLv(sig, px, true), u = useFrac(), spend = S.sizeQuote(e * u, Math.min(b.quote, e * u), A.stopPct, cfg, S.riskScale(P.consec, cfg));
@@ -474,7 +479,7 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    ver: 2.6, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 2.7, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
