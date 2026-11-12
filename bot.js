@@ -500,7 +500,7 @@ const routes = {
     const target = b.target ? num(b.target, 'target') : null; if (target && target <= px) throw new Error('Target must be above price');
     const bal = await balances(), e = equityOf(bal, px), sp = ((px - stop) / px) * 100;
     const spend = S.sizeQuote(e * useFrac(), Math.min(bal.quote, e * useFrac()), sp, cfg);
-    if (spend < cfg.minTradeQuote) throw new Error('Size too small for the risk settings / balance');
+    if (!(spend >= cfg.minTradeQuote)) throw new Error(`Nothing to trade with: spendable ${bal.quote.toFixed(6)} ${sym(pair.quote.currency)} (risk-sized ${spend.toFixed(6)}). Fund the wallet or add a trust line.`);
     if (!(await openPos(px, stop, target, spend, 'manual'))) throw new Error('Order not filled');
     P.pos.userStop = true; save(); return {};
   }),

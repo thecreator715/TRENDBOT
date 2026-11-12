@@ -748,9 +748,9 @@ function step(){
 }
 const SIM={
   buy(p){if(S.halted&&S.goalHit)throw Error('Daily goal reached: press Resume to keep trading');if(S.pos&&S.pos2)throw Error('Both legs already open');if(S.pos&&S.pos.side==='LONG')throw Error('Already long: open a short to hedge, or close first');const px=S.px,stop=+p.stop;if(!(stop<px))throw Error('Stop must be below price');const tg=p.target?+p.target:null;if(tg&&tg<=px)throw Error('Target must be above price');
-    const eq=eqNow(),sp=sizeQuote(eq,S.quoteBal,(px-stop)/px*100);if(sp<eq*.005)throw Error('Size too small for risk settings');openOpp(()=>simOpenLong(stop,tg,sp,true))},
+    const eq=eqNow(),sp=sizeQuote(eq,S.quoteBal,(px-stop)/px*100);if(!(sp>0))throw Error('Nothing to trade with: no spendable balance');openOpp(()=>simOpenLong(stop,tg,sp,true))},
   short(p){if(S.halted&&S.goalHit)throw Error('Daily goal reached: press Resume to keep trading');if(S.pos&&S.pos2)throw Error('Both legs already open');if(S.pos&&S.pos.side==='SHORT')throw Error('Already short: open a long to hedge, or close first');const px=S.px,stop=+p.stop;if(!(stop>px))throw Error('Short stop must be above price');const tg=p.target?+p.target:null;if(tg&&tg>=px)throw Error('Short target must be below price');
-    const eq=eqNow(),q=sizeShortBase(eq,px,stop,S.baseBal);if(q*px<eq*.005)throw Error('Not enough inventory to short');openOpp(()=>simOpenShort(stop,tg,q,true))},
+    const eq=eqNow(),q=sizeShortBase(eq,px,stop,S.baseBal);if(!(q>0))throw Error('No base inventory to short');openOpp(()=>simOpenShort(stop,tg,q,true))},
   sell(p){if(!S.pos)throw Error('No open position');if(S.pos2)slot2(()=>{if(S.pos)simClose('manual')});if(S.pos)simClose('manual');promote()},
   lines(p){if(!S.pos)throw Error('No open position');const sh=S.pos.side==='SHORT';
     if(p.stop!=null){if(sh?p.stop<=S.px:p.stop>=S.px)throw Error(sh?'Short stop must be above price':'Stop must be below price');S.pos.stop=p.stop;S.pos.userStop=true}
