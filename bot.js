@@ -166,12 +166,12 @@ async function walletTx() {
 async function balances() {
   if (!wallet) return { base: P.paper.base, quote: P.paper.quote };
   if (MOCK) return { base: 0, quote: 0 };
-  const w = await walletData();
+  const w = await walletData(); walC = w; walAt = Date.now();
   const get = a => {
     if (isXRP(a)) return w.spendable;
     const l = w.lines.find(x => x.raw === a.currency && x.issuer === a.issuer);
-    if (!l) throw new Error(`No trust line for ${sym(a.currency)} on this wallet. Add it first.`);
-    return l.balance;
+    if (!l) { last.noTrust = `No trust line for ${sym(a.currency)} on this wallet: add it on the Wallet page (Receive / trust line).`; return 0; }
+    last.noTrust = null; return l.balance;
   };
   return { base: get(pair.base), quote: get(pair.quote) };
 }
@@ -351,7 +351,7 @@ async function manageTp(px) {
 // ---------- strategy context / allocation ----------
 const mkCtx = () => S.ctxFrom(candles.closed, S.aggregate(candles.closed, candles.cur, cfg.htfMult || 4), { tradesToday: P.tradesToday || 0 });
 const useFrac = () => Math.min(1, Math.max(0.05, (P.use ?? 100) / 100));
-let balC = null, balAt = 0, offC = [], offAt = 0, xuC = null, xuAt = 0;
+let walC = null, walAt = 0, walTxC = [], walTxAt = 0, balC = null, balAt = 0, offC = [], offAt = 0, xuC = null, xuAt = 0;
 const amtOf = x => (typeof x === 'string' ? { cur: 'XRP', v: Number(x) / 1e6, iss: null } : { cur: x.currency, v: Number(x.value), iss: x.issuer });
 const isAsset = (x, a) => (isXRP(a) ? x.cur === 'XRP' : x.cur === a.currency && x.iss === a.issuer);
 async function refreshOffers(force) {
@@ -380,7 +380,8 @@ async function tick() {
     try { await dexWicks(pair, px); } catch (e) { last.dexErr = e.message; }
     P.ticks.push([now, px]);
     const closedNow = candles.push(now, px);
-    let b = balC; if (!(Date.now() - balAt < 8000 && balC)) { b = await balances(); balC = b; balAt = Date.now(); }
+    let b = balC; if (!(Date.now() - balAt < 3000 && balC)) { b = await balances(); balC = b; balAt = Date.now(); }
+    if (wallet && !MOCK && Date.now() - walTxAt > 20000) { walTxAt = Date.now(); walletTx().then(t => { walTxC = t; }).catch(() => {}); }
     const e = equityOf(b, px);
     if (startEq == null) startEq = e;
     const dk = new Date().toISOString().slice(0, 10);
@@ -454,7 +455,7 @@ const view = () => {
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
-    use: P.use ?? 100, goal: P.goal || 0, goalHit: !!P.goalHit, trades: state.trades.filter(t => !t.pair || t.pair === pair.id).slice(-300), marks: (P.marks || []).slice(-120), eq, start: startEq, logs, cfg: { ...S.DEFAULTS, ...cfg }, consec: P.consec, bal: balC, eqNow: last.eq ?? null, note: last.note || null,
+    use: P.use ?? 100, goal: P.goal || 0, goalHit: !!P.goalHit, trades: state.trades.filter(t => !t.pair || t.pair === pair.id).slice(-300), marks: (P.marks || []).slice(-120), eq, start: startEq, logs, cfg: { ...S.DEFAULTS, ...cfg }, consec: P.consec, bal: balC, wal: walC ? { ...walC, at: walAt } : null, wtx: walTxC, noTrust: last.noTrust || null, eqNow: last.eq ?? null, note: last.note || null,
   };
 };
 const body = req => new Promise((res, rej) => { let d = ''; req.on('data', c => { d += c; if (d.length > 20000) { rej(new Error('too large')); req.destroy(); } }); req.on('end', () => { try { res(d ? JSON.parse(d) : {}); } catch (e) { rej(e); } }); });
@@ -550,6 +551,28 @@ const routes = {
     if (!offC.some(o => o.seq === seq)) throw new Error('That order is not on this pair');
     const res = await client.submitAndWait({ TransactionType: 'OfferCancel', Account: wallet.address, OfferSequence: seq }, { wallet, autofill: true });
     offAt = 0; balAt = 0; const code = res.result.meta.TransactionResult; if (code !== 'tesSUCCESS') throw new Error('Cancel failed: ' + code); addLog('info', 'Order #' + seq + ' cancelled'); return {};
+  }),
+  'POST /api/send': async (b) => locked(async () => {
+    if (!wallet) throw new Error('No wallet connected'); if (MOCK) throw new Error('mock mode');
+    if (b.confirm !== true) throw new Error('Not confirmed');
+    if (P.pos || P.pend) throw new Error('Close the open position / cancel the pending entry first: sending funds would break its accounting');
+    const to = String(b.to || '').trim(); if (!xrpl.isValidClassicAddress(to)) throw new Error('Invalid destination address'); if (to === wallet.address) throw new Error('Destination is this wallet');
+    const n = num(b.amount, 'amount'), cur = String(b.currency || 'XRP'), w = await walletData(); let Amount;
+    if (cur === 'XRP') { if (n > w.spendable + 1e-9) throw new Error(`Only ${w.spendable.toFixed(4)} XRP is spendable (reserve + buffer held back)`); Amount = xrpl.xrpToDrops(n.toFixed(6)); }
+    else { const l = w.lines.find(x => x.raw === cur && x.issuer === b.issuer); if (!l) throw new Error('No such trust line on this wallet'); if (n > l.balance + 1e-9) throw new Error(`Only ${l.balance} ${sym(cur)} available`); Amount = { currency: cur, issuer: l.issuer, value: String(n) }; }
+    const tx = { TransactionType: 'Payment', Account: wallet.address, Destination: to, Amount };
+    if (b.tag !== undefined && b.tag !== null && String(b.tag).trim() !== '') { const t = Number(b.tag); if (!Number.isInteger(t) || t < 0 || t > 4294967295) throw new Error('Invalid destination tag'); tx.DestinationTag = t; }
+    const res = await client.submitAndWait(tx, { wallet, autofill: true }), code = res.result.meta.TransactionResult;
+    balAt = 0; walTxAt = 0; if (code !== 'tesSUCCESS') throw new Error('Payment failed: ' + code);
+    addLog('info', `SENT ${n} ${cur === 'XRP' ? 'XRP' : sym(cur)} to ${to}${tx.DestinationTag !== undefined ? ' tag ' + tx.DestinationTag : ''} (${res.result.hash})`); return { hash: res.result.hash };
+  }),
+  'POST /api/trust': async (b) => locked(async () => {
+    if (!wallet) throw new Error('No wallet connected'); if (MOCK) throw new Error('mock mode');
+    const symb = String(b.symbol || '').trim(), issuer = String(b.issuer || '').trim();
+    if (!symb || !xrpl.isValidClassicAddress(issuer)) throw new Error('need a currency code and a valid issuer address');
+    const res = await client.submitAndWait({ TransactionType: 'TrustSet', Account: wallet.address, LimitAmount: { currency: hex(symb), issuer, value: String(b.limit || '1000000000') } }, { wallet, autofill: true }), code = res.result.meta.TransactionResult;
+    balAt = 0; if (code !== 'tesSUCCESS') throw new Error('Trust line failed: ' + code);
+    addLog('info', `Trust line set for ${symb} (${issuer}): you can now receive it (holds 0.2 XRP reserve)`); return {};
   }),
   'POST /api/cancelall': async () => locked(async () => {
     if (!wallet) throw new Error('No wallet'); let n = 0;
