@@ -142,16 +142,16 @@ async function price() {
 }
 async function walletData() {
   const [info, lines, srv, offers] = await Promise.all([
-    client.request({ command: 'account_info', account: wallet.address, ledger_index: 'validated' }),
-    client.request({ command: 'account_lines', account: wallet.address, ledger_index: 'validated', limit: 400 }),
+    client.request({ command: 'account_info', account: wallet.address, ledger_index: 'current' }),
+    client.request({ command: 'account_lines', account: wallet.address, ledger_index: 'current', limit: 400 }),
     client.request({ command: 'server_info' }),
     client.request({ command: 'account_offers', account: wallet.address, limit: 50 }),
   ]);
-  const vl = srv.result.info.validated_ledger, owner = info.result.account_data.OwnerCount;
-  const reserve = vl.reserve_base_xrp + vl.reserve_inc_xrp * owner;
+  const vl = srv.result.info.validated_ledger || {}, owner = info.result.account_data.OwnerCount || 0, rb = Number(vl.reserve_base_xrp ?? 1), ri = Number(vl.reserve_inc_xrp ?? 0.2);
+  const reserve = rb + ri * owner;
   const bal = Number(info.result.account_data.Balance) / 1e6;
   return {
-    address: wallet.address, xrp: bal, reserve, spendable: Math.max(0, bal - reserve - cfg.xrpReserveBuffer), owner,
+    address: wallet.address, xrp: bal, reserve, reserveBase: rb, reserveInc: ri, spendable: Math.max(0, bal - reserve - cfg.xrpReserveBuffer), owner,
     lines: lines.result.lines.map(l => ({ currency: sym(l.currency), raw: l.currency, issuer: l.account, balance: Number(l.balance), limit: Number(l.limit) })),
     offers: offers.result.offers.length,
   };

@@ -1224,7 +1224,7 @@ function renderWalletHeader(){const live=MODE==='live',on=live&&S.live;
 async function loadWallet(){if(MODE!=='live'||!S.live)return;
   try{const r=await fetch('/api/wallet',{cache:'no-store'});const w=await r.json();if(!r.ok)throw Error(w.error);paintWallet(w)}catch(e){toast('Wallet: '+e.message)}}
 function paintWallet(w){try{WALLET=w;sendFormSync();
-    $('wAddr').textContent=w.address;$('wXrp').textContent=w.xrp.toFixed(4);$('wRes').textContent=w.reserve.toFixed(2);$('wSpend').textContent=w.spendable.toFixed(4);$('wOff').textContent=w.offers;
+    $('wAddr').textContent=w.address;$('wXrp').textContent=w.xrp.toFixed(4);$('wRes').textContent=w.reserve.toFixed(2)+' ('+(w.reserveBase??1)+' + '+(w.reserveInc??0.2)+' × '+w.owner+' objects)';$('wSpend').textContent=w.spendable.toFixed(4);$('wOff').textContent=w.offers;
     $('wLines').innerHTML=`<tr><td>XRP</td><td class="k">native</td><td>${w.xrp.toFixed(4)}</td></tr>`+w.lines.map(l=>`<tr><td>${l.currency}</td><td class="k">${l.issuer.slice(0,6)}…${l.issuer.slice(-4)}</td><td>${l.balance.toLocaleString(undefined,{maximumFractionDigits:6})}</td></tr>`).join('');
     $('wTx').innerHTML=w.tx.map(t=>`<tr><td>${t.type||'?'}</td><td class="${t.result==='tesSUCCESS'?'':'neg'}">${t.result||''}</td><td class="k">${t.date?new Date(t.date).toLocaleString():''}</td></tr>`).join('')||'<tr><td colspan="3" class="k">none</td></tr>'}catch(e){console.error(e)}}
 // ================= wiring =================
