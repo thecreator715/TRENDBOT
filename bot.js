@@ -31,7 +31,8 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 // ---------- pairs ----------
 let pairs = [{ id: 'XRP/RLUSD', base: XRP, quote: RLUSD }];
 const GHBTC = { currency: 'BTC', issuer: 'rchGBxcD1A1C2tdxF6papQYZ8kjRKMYcL' }; // GateHub BTC
-pairs.push({ id: 'BTC/XRP', base: GHBTC, quote: XRP });
+const GHETH = { currency: 'ETH', issuer: 'rcA8X3TVMST1n3CJeAdGk1RdRCHii7N2h' }; // GateHub ETH
+pairs.push({ id: 'BTC/XRP', base: GHBTC, quote: XRP }, { id: 'ETH/XRP', base: GHETH, quote: XRP });
 try { for (const p of JSON.parse(fs.readFileSync(F('pairs.json'), 'utf8'))) if (!pairs.some(x => x.id === p.id)) pairs.push(p); } catch {}
 const pairById = id => pairs.find(p => p.id === id);
 
@@ -75,13 +76,13 @@ function loadPair() {
 async function backfill() {
   const P0 = P, pid = pair.id;
   P0.bfAt = Date.now();
-  if (MOCK || P0.ticks.length > 200 || (pid !== 'XRP/RLUSD' && pid !== 'BTC/XRP')) { P0.bfDone = true; return; }
+  if (MOCK || P0.ticks.length > 200 || !({ 'XRP/RLUSD': 1, 'BTC/XRP': 1, 'ETH/XRP': 1 })[pid]) { P0.bfDone = true; return; }
   try {
     const base = process.env.TB_OHLC || 'https://www.bitstamp.net/api/v2/ohlc/', get = async m => ((await (await fetch(`${base}${m}/?step=60&limit=1000`)).json()).data || {}).ohlc || [];
     let bars;
     if (pid === 'XRP/RLUSD') bars = (await get('xrpusd')).map(b => ({ t: +b.timestamp * 1000, o: +b.open, h: +b.high, l: +b.low, c: +b.close }));
-    else { // BTC/XRP = BTC/USD divided by XRP/USD, minute by minute
-      const [bt, xr] = await Promise.all([get('btcusd'), get('xrpusd')]), xm = new Map(xr.map(x => [x.timestamp, x]));
+    else { // BTC/XRP, ETH/XRP = coin/USD divided by XRP/USD, minute by minute
+      const [bt, xr] = await Promise.all([get(pid === 'BTC/XRP' ? 'btcusd' : 'ethusd'), get('xrpusd')]), xm = new Map(xr.map(x => [x.timestamp, x]));
       bars = []; for (const q of bt) { const x = xm.get(q.timestamp); if (!x) continue; const xo = +x.open, xc = +x.close, xa = (xo + xc) / 2; if (!(xa > 0)) continue;
         const o = +q.open / xo, c = +q.close / xc; bars.push({ t: +q.timestamp * 1000, o, c, h: Math.max(o, c, +q.high / xa), l: Math.min(o, c, +q.low / xa) }); }
     }
@@ -549,7 +550,7 @@ function loadCtx(id) {
   pair = pairById(id); const c = ctxMap[id];
   if (c) { P = state.pairs[id] ||= { closed: [], cur: null, pos: null, cooldownUntil: 0, consec: 0, paper: { base: 0, quote: 1000 } }; P.ticks ||= []; ({ candles, last, startEq, runStartEq, prevB, offC, offAt, xuC, xuAt, dayKey, balC, balAt } = c); eq.length = 0; eq.push(...c.eqArr); }
   else { loadPair(); last = { px: null, sig: { trend: 'NONE', why: 'warming up' }, err: null }; runStartEq = null; prevB = null; offC = []; offAt = 0; xuC = null; xuAt = 0; dayKey = null; balC = null; balAt = 0; }
-  if (P.use == null && pair.id === 'BTC/XRP') P.use = 50;
+  if (P.use == null && (pair.id === 'BTC/XRP' || pair.id === 'ETH/XRP')) P.use = 40;
 }
 const activeIds = () => { const s = new Set([pair.id, ...(state.active || [pair.id])]); for (const id of Object.keys(state.pairs || {})) if (state.pairs[id] && (state.pairs[id].pos || state.pairs[id].pend) && pairById(id)) s.add(id); return [...s].filter(id => pairById(id)); };
 async function tick() {
@@ -574,8 +575,8 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    active: state.active || [pair.id], multi: pairs.map(p => { const q = state.pairs[p.id] || {}, c = p.id === pair.id ? { last } : (ctxMap[p.id] || {}), l = c.last || {}; return { id: p.id, on: (state.active || []).includes(p.id), side: q.pos ? q.pos.side : null, px: l.px ?? null, err: l.err || null, trades: hist.trades.filter(t => t.pair === p.id).length, pnl: +hist.trades.filter(t => t.pair === p.id).reduce((a, t) => a + (t.pnl || 0), 0).toFixed(6), open: q.pos ? +(q.pos.side === 'SHORT' ? q.pos.cost - q.pos.base * (l.px || 0) : q.pos.base * (l.px || 0) - q.pos.cost).toFixed(6) : 0, quote: sym(p.quote.currency) }; }),
-    ver: 3.2, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    active: state.active || [pair.id], multi: pairs.map(p => { const q = state.pairs[p.id] || {}, c = p.id === pair.id ? { last } : (ctxMap[p.id] || {}), l = c.last || {}; return { id: p.id, on: (state.active || []).includes(p.id), side: q.pos ? q.pos.side : null, px: l.px ?? null, err: l.err || null, trades: hist.trades.filter(t => t.pair === p.id).length, pnl: +hist.trades.filter(t => t.pair === p.id).reduce((a, t) => a + (t.pnl || 0), 0).toFixed(6), pos: q.pos ? { side: q.pos.side, base: q.pos.base, entry: q.pos.entry, stop: q.pos.stop, target: q.pos.target || null, bsym: sym(p.base.currency), risk: q.pos.risk || null } : null, open: q.pos ? +(q.pos.side === 'SHORT' ? q.pos.cost - q.pos.base * (l.px || 0) : q.pos.base * (l.px || 0) - q.pos.cost).toFixed(6) : 0, quote: sym(p.quote.currency) }; }),
+    ver: 3.3, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
