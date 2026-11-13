@@ -303,7 +303,7 @@ body.chartonly .colB,body.chartonly .colC{display:none!important}body.chartonly 
   <div class="an">
     <div class="card"><h2><span>Performance statistics</span></h2><div id="statsTbl"></div></div>
     <div class="card"><h2><span>Trade journal</span><button class="sm" id="bCsv">Copy CSV</button></h2>
-      <div class="fl" id="jfilters"></div><div style="max-height:420px;overflow:auto"><table class="tr"><thead><tr><th>#</th><th>SIDE</th><th>EXIT</th><th>BARS</th><th>R</th><th>P/L</th></tr></thead><tbody id="journal"></tbody></table></div></div>
+      <div class="fl" id="jfilters"></div><div style="max-height:420px;overflow:auto"><table class="tr"><thead><tr><th>#</th><th>SIDE</th><th>EXIT</th><th>BARS</th><th>R</th><th>P/L</th><th><button class="sm" id="bPurge" title="Remove impossible / demo trades">clean</button></th></tr></thead><tbody id="journal"></tbody></table></div></div>
   </div>
   <div class="sec">Deep analytics · 25 more</div>
   <div class="an" id="deepA"></div>
@@ -968,7 +968,9 @@ function renderAnalytics(){
   $('jfilters').innerHTML=Object.keys(flt).map(k=>`<button class="sm ${JF===k?'on':''}" data-jf="${k}">${k}</button>`).join('');
   $('jfilters').querySelectorAll('button').forEach(b=>b.onclick=()=>{JF=b.dataset.jf;renderAnalytics()});
   try{deepAnalytics(T,m,base)}catch(e){console.error(e)}
-  $('journal').innerHTML=T.map((t,i)=>({t,i})).filter(o=>flt[JF](o.t)).reverse().slice(0,200).map(({t,i})=>`<tr><td class="k">${i+1}</td><td>${t.side}</td><td class="k">${t.reason||''}</td><td>${t.bars||0}</td><td>${t.r!=null?sg(t.r,2):'—'}</td><td class="${t.pnl>=0?'pos':'neg'}">${sg(t.pnl,3)}</td></tr>`).join('')||'<tr><td colspan="6" class="k">no trades</td></tr>';
+  $('journal').innerHTML=T.map((t,i)=>({t,i})).filter(o=>flt[JF](o.t)).reverse().slice(0,200).map(({t,i})=>`<tr><td class="k">${i+1}</td><td>${t.side}</td><td class="k">${t.reason||''}</td><td>${t.bars||0}</td><td>${t.r!=null?sg(t.r,2):'—'}</td><td class="${t.pnl>=0?'pos':'neg'}">${sg(t.pnl,3)}</td><td><button class="sm" data-dt="${i}" title="Delete this trade from analytics">✕</button></td></tr>`).join('')||'<tr><td colspan="7" class="k">no trades</td></tr>';
+  $('journal').onclick=async e=>{const b=e.target.closest('[data-dt]');if(!b)return;const t=T[+b.dataset.dt];if(!t)return;if(MODE==='live'){try{const st=JSON.parse(localStorage.getItem('tb_hist_v1')||'{}');if(st[S.pair]){st[S.pair]=st[S.pair].filter(x=>!(x.t===t.t&&x.side===t.side&&x.entry===t.entry));localStorage.setItem('tb_hist_v1',JSON.stringify(st))}}catch{}await act('deltrade',{t:t.t,side:t.side,entry:t.entry})}else{S.trades.splice(+b.dataset.dt,1);render()}renderAnalytics()};
+  $('bPurge').onclick=async()=>{const lim=3*Math.max(10,S.base0||0,S.eqAll||0,S.start||0);if(MODE==='live'){const bad=T.filter(t=>Math.abs(t.pnl)>lim);try{const st=JSON.parse(localStorage.getItem('tb_hist_v1')||'{}');if(st[S.pair]){st[S.pair]=st[S.pair].filter(x=>Math.abs(x.pnl)<=lim);localStorage.setItem('tb_hist_v1',JSON.stringify(st))}}catch{}await act('purge',{});toast('Removed '+bad.length+' impossible trade(s)')}else{const n0=S.trades.length;S.trades=S.trades.filter(t=>typeof t==='number'?Math.abs(t)<=lim:Math.abs(t.pnl)<=lim);toast('Removed '+(n0-S.trades.length)+' trade(s)');render()}renderAnalytics()};
 }
 
 // ================= extra charts + analytics (25 analytics + 25 wallet) =================

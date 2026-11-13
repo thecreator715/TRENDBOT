@@ -41,6 +41,9 @@ let hist = (() => { for (const f of ['history.json', 'history.bak.json']) { try 
 hist.trades ||= []; hist.eq ||= []; hist.base ||= {}; hist.since ||= Date.now();
 state.trades ||= [];
 { const kT = t => `${t.t}|${t.pair}|${t.side}|${t.entry}`, seen = new Set(state.trades.map(kT)); for (const t of hist.trades) if (!seen.has(kT(t))) state.trades.push(t); state.trades.sort((a, b) => a.t - b.t); hist.trades = state.trades.slice(); }
+const tradeLimit = (pid) => 3 * Math.max(10, (hist.base[pid] || {}).eq || 0, (() => { try { return last.eqAll || 0; } catch { return 0; } })());
+function purgeTrades(match) { const n0 = state.trades.length, keep = t => !match(t); state.trades = state.trades.filter(keep); hist.trades = hist.trades.filter(keep); return n0 - state.trades.length; }
+{ const n = purgeTrades(t => typeof t.pnl !== 'number' || !isFinite(t.pnl) || Math.abs(t.pnl) > tradeLimit(t.pair)); if (n) console.log(`removed ${n} impossible trade(s) from analytics (P/L larger than 3x the account)`); }
 let histAt = 0, bakAt = 0;
 function saveHist(force) {
   if (!force && Date.now() - histAt < 20000) return; histAt = Date.now();
@@ -274,6 +277,7 @@ function recordExit(rBase, rQuote, rPrice, reason) {
   const pos = P.pos, short = pos.side === 'SHORT';
   const portion = Math.min(1, rBase / pos.base);
   const pnl = short ? pos.cost * portion - rQuote : rQuote - pos.cost * portion;
+  if (!isFinite(pnl) || Math.abs(pnl) > tradeLimit(pair.id)) { addLog('info', `exit P/L ${pnl} looks impossible for this account: not counted in analytics`); P.pos = null; return; }
   P.dayPnl = (P.dayPnl || 0) + pnl;
   if (pnl < 0 && /stop/.test(reason)) P.lastStop = { t: Date.now(), long: !short };
   pos.cost -= pos.cost * portion; pos.base -= rBase;
@@ -610,6 +614,8 @@ const routes = {
   'POST /api/take': async (b) => locked(async () => { if (!P.pos) throw new Error('No open position'); const px = await price(); const f = Math.min(1, Math.max(0.05, +b.frac || 0.5)); if (!(await closePos(px, 'take profit', cfg.entrySlippagePct, f))) throw new Error('Order not filled'); save(); return {}; }),
   'POST /api/hedge': async () => { throw new Error('Hedge (long+short) is simulator-only for now'); },
   'POST /api/smart': async (b) => { cfg.smart = !!b.on; addLog('info', 'Smart brain ' + (cfg.smart ? 'ON' : 'OFF')); return {}; },
+  'POST /api/deltrade': async (b) => { const n = purgeTrades(t => t.t === +b.t && t.side === b.side && Math.abs(t.entry - +b.entry) < 1e-9); saveHist(true); save(); return { removed: n }; },
+  'POST /api/purge': async () => { const n = purgeTrades(t => Math.abs(t.pnl) > tradeLimit(t.pair) || (t.reason === 'stop' && t.r > 0 && t.pnl > 0 && Math.abs(t.pnl) > 5 * Math.max(0.5, tradeLimit(t.pair) / 3 * 0.05))); saveHist(true); save(); return { removed: n }; },
   'POST /api/smartfeat': async (b) => { const id = String(b.id || ''); if (!require('./brain').FEATURES.some(f => f.id === id)) throw new Error('unknown feature'); const off = new Set(cfg.smartOff || []); if (b.on) off.delete(id); else off.add(id); cfg.smartOff = [...off]; return {}; },
   'POST /api/limit': async (b) => locked(async () => {
     if (!wallet) throw new Error('Connect a wallet to place real orders'); if (MOCK) throw new Error('mock mode');
