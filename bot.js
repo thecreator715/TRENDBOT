@@ -30,7 +30,9 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 // ---------- pairs ----------
 let pairs = [{ id: 'XRP/RLUSD', base: XRP, quote: RLUSD }];
-try { pairs = pairs.concat(JSON.parse(fs.readFileSync(F('pairs.json'), 'utf8'))); } catch {}
+const GHBTC = { currency: 'BTC', issuer: 'rchGBxcD1A1C2tdxF6papQYZ8kjRKMYcL' }; // GateHub BTC
+pairs.push({ id: 'BTC/XRP', base: GHBTC, quote: XRP });
+try { for (const p of JSON.parse(fs.readFileSync(F('pairs.json'), 'utf8'))) if (!pairs.some(x => x.id === p.id)) pairs.push(p); } catch {}
 const pairById = id => pairs.find(p => p.id === id);
 
 // ---------- state ----------
@@ -56,7 +58,7 @@ function saveHist(force) {
 const { Brain } = require('./brain');
 const brain = new Brain(); state.brain ||= {}; brain.acfg = state.brain.acfg || {}; brain.lastTune = state.brain.lastTune || null; brain.hits = state.brain.hits || {};
 brain.rebuild(hist.trades.filter(t => true));
-state.pairId ||= 'XRP/RLUSD'; state.autoOn ??= true; state.shortOn ??= !!cfg.autoShort; state.pairs ||= {}; state.trades ||= [];
+state.pairId ||= 'XRP/RLUSD'; state.active = (Array.isArray(state.active) && state.active.length ? state.active : [state.pairId]).filter(id => pairs.some(p => p.id === id)); state.autoOn ??= true; state.shortOn ??= !!cfg.autoShort; state.pairs ||= {}; state.trades ||= [];
 let pair = pairById(state.pairId) || pairs[0];
 let P, candles; // per-pair runtime
 const logs = []; const eq = []; let startEq = null, dayKey = null;
@@ -89,7 +91,7 @@ async function backfill() {
 }
 function save() {
   if (P.ticks.length > 8000) P.ticks.splice(0, P.ticks.length - 6000);
-  P.closed = candles.closed; P.cur = candles.cur; state.pairId = pair.id;
+  P.closed = candles.closed; P.cur = candles.cur; state.pairId = viewPair || pair.id;
   state.brain = { acfg: brain.acfg, lastTune: brain.lastTune, hits: brain.hits };
   fs.writeFileSync(F('state.json') + '.tmp', JSON.stringify(state));
   fs.renameSync(F('state.json') + '.tmp', F('state.json'));
@@ -216,11 +218,14 @@ async function swap(side, amountIn, px, slipPct) {
   const before = await balances();
   const res = await sub({ TransactionType: 'OfferCreate', Account: wallet.address, TakerGets: gets, TakerPays: pays, Flags: IOC }, { wallet, autofill: true });
   const code = res.result.meta.TransactionResult;
-  await sleep(1500);
-  const after = await balances();
   const fee = Number(res.result.Fee || 0) / 1e6;
-  const dB = after.base - before.base + (isXRP(pair.base) ? fee : 0);
-  const dQ = after.quote - before.quote + (isXRP(pair.quote) ? fee : 0);
+  // exact fill from this transaction's own metadata, so another pair's trades/resting orders on the shared wallet can't distort it; balance deltas only as a fallback
+  const mc = (() => { try { const c = xrpl.getBalanceChanges(res.result.meta).find(x => x.account === wallet.address); return c ? c.balances : []; } catch { return []; } })();
+  const pick = a => { const r = mc.find(x => (isXRP(a) ? x.currency === 'XRP' : x.currency === a.currency && x.issuer === a.issuer)); return r ? Number(r.value) : null; };
+  const mB = pick(pair.base), mQ = pick(pair.quote);
+  let dB, dQ;
+  if (mc.length) { dB = (mB ?? 0) + (isXRP(pair.base) ? fee : 0); dQ = (mQ ?? 0) + (isXRP(pair.quote) ? fee : 0); }
+  else { await sleep(1500); const after = await balances(); dB = after.base - before.base + (isXRP(pair.base) ? fee : 0); dQ = after.quote - before.quote + (isXRP(pair.quote) ? fee : 0); }
   if (code !== 'tesSUCCESS' || Math.abs(dQ) < 1e-9) return { filled: false, code };
   const fp = Math.abs(dQ) / Math.abs(dB); brain.recordSlip((side === 'BUY' ? fp / px - 1 : 1 - fp / px) * 100);
   return { filled: true, code, base: Math.abs(dB), quote: Math.abs(dQ), price: fp };
@@ -275,6 +280,8 @@ async function closePos(px, reason, slip, frac = 1) {
 
 function recordExit(rBase, rQuote, rPrice, reason) {
   const pos = P.pos, short = pos.side === 'SHORT';
+  // a cover IOC can buy slightly more than was owed (slippage headroom): count only the owed base, the surplus is just inventory
+  if (short && rBase > pos.base * 1.0000001) { rQuote = rQuote * pos.base / rBase; rBase = pos.base; }
   const portion = Math.min(1, rBase / pos.base);
   const pnl = short ? pos.cost * portion - rQuote : rQuote - pos.cost * portion;
   if (!isFinite(pnl) || Math.abs(pnl) > tradeLimit(pair.id)) { addLog('info', `exit P/L ${pnl} looks impossible for this account: not counted in analytics`); P.pos = null; return; }
@@ -338,6 +345,7 @@ function brainSnap() { const src = last.src || {}; return { ask: last.ask, bid: 
 const ecfg = () => (cfg.smart !== false ? { ...cfg, ...brain.acfg } : cfg);
 let lastVeto = '', lastVetoAt = 0;
 async function enter(long, px, stop, target, amt, why) {
+  if (!tradeOK) return false;
   if (cfg.smart !== false) {
     const d = brain.evaluate({ long, px, stop, closed: candles.closed, cfg, snap: brainSnap(), sess: { consec: P.consec || 0, ddPct: last.ddPct || 0 }, relaxed: /^always-in/.test(why), orderQuote: long ? amt : amt * px });
     if (!d.ok) { if (d.why !== lastVeto || Date.now() - lastVetoAt > 60000) { lastVeto = d.why; lastVetoAt = Date.now(); addLog('info', `SMART skipped ${long ? 'long' : 'short'}: ${d.why}`); } return false; }
@@ -359,6 +367,7 @@ async function placeTp(pos) {
 async function handlePend(px, halt) {
   const o = P.pend; await refreshOffers(true);
   let live = o.seq ? offC.find(x => x.seq === o.seq) : null;
+  const filled0 = o.seq ? (live ? Math.max(0, o.base - live.base) : o.base) : 0; // base filled, from the order itself (not wallet balances)
   const age = (Date.now() - o.t0) / 1000, ch = cfg.limitChasePct / 100;
   const away = o.long ? px > (o.sigPx || o.price) * (1 + ch) : px < (o.sigPx || o.price) * (1 - ch), dead = o.long ? px <= o.stop : px >= o.stop, timeout = age > cfg.limitTimeoutSec;
   let why = null;
@@ -375,7 +384,7 @@ async function handlePend(px, halt) {
     return;
   }
   balAt = 0; const b = await balances(); balC = b; balAt = Date.now();
-  const dBase = o.long ? b.base - o.pre.base : o.pre.base - b.base, dQuote = Math.abs(b.quote - o.pre.quote);
+  const dBase = filled0, dQuote = filled0 * o.price;
   P.pend = null;
   if (dBase >= o.base * 0.05 && dBase * px >= cfg.minTradeQuote * 0.1) {
     const entry = dBase > 0 ? dQuote / dBase : o.price, A = autoLv({ stop: o.stop, target: o.target, stopPct: 0 }, entry, o.long); // re-anchor % stop/target to the real fill
@@ -398,7 +407,7 @@ async function manageTp(px) {
   const reached = long ? Math.max(px, c ? c.high : px) >= pos.tp.price * 0.999 : Math.min(px, c ? c.low : px) <= pos.tp.price * 1.001;
   if (!o && !reached) { pos.tp = null; addLog('info', 'take-profit order is gone from the book (cancelled elsewhere?), software exits still active'); return; }
   const filled = pos.tp.left - left;
-  if (filled > 1e-9) { pos.tp.left = left; recordExit(filled, filled * pos.tp.price, pos.tp.price, 'take-profit (limit)'); }
+  if (filled > Math.max(1e-9, pos.tp.left * 1e-5)) { pos.tp.left = left; recordExit(filled, filled * pos.tp.price, pos.tp.price, 'take-profit (limit)'); }
   if (P.pos && !o) P.pos.tp = null;
 }
 
@@ -426,8 +435,7 @@ async function xuNow(px) {
 // ---------- main tick ----------
 let last = { px: null, sig: { trend: 'NONE', why: 'warming up' }, err: null };
 const equityOf = (b, px) => b.quote + b.base * px;
-async function tick() {
-  if (busy) { if (Date.now() - busySince > 90000) { log('watchdog: tick was stuck for 90s, resetting'); busy = false; } else return; } busy = true; busySince = Date.now();
+async function tickBody() {
   try {
     const px = await price(); last.px = px; last.err = null; last.at = Date.now(); errRun = 0;
     const now = Date.now();
@@ -524,7 +532,32 @@ async function tick() {
     }
     save();
   } catch (err) { last.err = err.message; log('tick error:', err.message); if (!MOCK && ++errRun >= 4) rotateServer(); }
-  finally { busy = false; }
+}
+// ---------- simultaneous pairs: every active pair runs its own tick, one after another, by swapping the per-pair runtime in and out ----------
+const ctxMap = {}; let viewPair = null;
+let tradeOK = true;
+const snapCtx = () => ({ candles, last, startEq, runStartEq, prevB, offC, offAt, xuC, xuAt, dayKey, balC, balAt, eqArr: eq.slice() });
+function loadCtx(id) {
+  pair = pairById(id); const c = ctxMap[id];
+  if (c) { P = state.pairs[id] ||= { closed: [], cur: null, pos: null, cooldownUntil: 0, consec: 0, paper: { base: 0, quote: 1000 } }; P.ticks ||= []; ({ candles, last, startEq, runStartEq, prevB, offC, offAt, xuC, xuAt, dayKey, balC, balAt } = c); eq.length = 0; eq.push(...c.eqArr); }
+  else { loadPair(); last = { px: null, sig: { trend: 'NONE', why: 'warming up' }, err: null }; runStartEq = null; prevB = null; offC = []; offAt = 0; xuC = null; xuAt = 0; dayKey = null; balC = null; balAt = 0; }
+  if (P.use == null && pair.id === 'BTC/XRP') P.use = 50;
+}
+const activeIds = () => { const s = new Set([pair.id, ...(state.active || [pair.id])]); for (const id of Object.keys(state.pairs || {})) if (state.pairs[id] && (state.pairs[id].pos || state.pairs[id].pend) && pairById(id)) s.add(id); return [...s].filter(id => pairById(id)); };
+async function tick() {
+  if (busy) { if (Date.now() - busySince > 90000) { log('watchdog: tick was stuck for 90s, resetting'); busy = false; } else return; } busy = true; busySince = Date.now();
+  const view0 = pair.id; viewPair = view0;
+  try {
+    for (const id of activeIds()) {
+      if (pair.id !== id) { ctxMap[pair.id] = snapCtx(); loadCtx(id); }
+      tradeOK = (state.active || [view0]).includes(id);
+      busySince = Date.now();
+      await tickBody();
+    }
+  } finally {
+    try { ctxMap[pair.id] = snapCtx(); if (pair.id !== view0) loadCtx(view0); } catch (e) { log('ctx restore failed:', e.message); }
+    tradeOK = true; viewPair = null; busy = false;
+  }
 }
 async function locked(fn) { while (busy && Date.now() - busySince < 90000) await sleep(60); busy = true; busySince = Date.now(); try { return await fn(); } finally { busy = false; } }
 
@@ -533,7 +566,8 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    ver: 3.0, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    active: state.active || [pair.id], multi: pairs.map(p => { const q = state.pairs[p.id] || {}, c = p.id === pair.id ? { last } : (ctxMap[p.id] || {}), l = c.last || {}; return { id: p.id, on: (state.active || []).includes(p.id), side: q.pos ? q.pos.side : null, px: l.px ?? null, err: l.err || null, trades: hist.trades.filter(t => t.pair === p.id).length, pnl: +hist.trades.filter(t => t.pair === p.id).reduce((a, t) => a + (t.pnl || 0), 0).toFixed(6), open: q.pos ? +(q.pos.side === 'SHORT' ? q.pos.cost - q.pos.base * (l.px || 0) : q.pos.base * (l.px || 0) - q.pos.cost).toFixed(6) : 0, quote: sym(p.quote.currency) }; }),
+    ver: 3.1, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
@@ -552,7 +586,8 @@ const routes = {
     wallet = w; addLog('info', 'Wallet connected: ' + w.address); loadPair(); return { address: w.address };
   },
   'POST /api/disconnect': async () => { if (P.pos) throw new Error('Close the open position first'); wallet = null; addLog('info', 'Wallet disconnected (seed cleared from memory)'); loadPair(); return {}; },
-  'POST /api/pair': async (b) => { if (P.pos || P.pend) throw new Error('Close the open position / pending order before switching pairs'); const p = pairById(b.id); if (!p) throw new Error('unknown pair'); save(); pair = p; loadPair(); last = { px: null, sig: { trend: 'NONE', why: 'warming up' }, err: null }; return {}; },
+  'POST /api/pair': async (b) => locked(async () => { const p = pairById(b.id); if (!p) throw new Error('unknown pair'); if (p.id === pair.id) return {}; ctxMap[pair.id] = snapCtx(); loadCtx(p.id); state.pairId = p.id; save(); return {}; }),
+  'POST /api/active': async (b) => locked(async () => { const p = pairById(b.id); if (!p) throw new Error('unknown pair'); const a = new Set(state.active || [pair.id]); if (b.on) a.add(p.id); else { const q = state.pairs[p.id]; if (q && (q.pos || q.pend)) throw new Error('Close its open position / pending order first (it keeps being managed until then)'); a.delete(p.id); } if (!a.size) throw new Error('Keep at least one pair trading'); state.active = [...a]; save(); return {}; }),
   'POST /api/addpair': async (b) => {
     const symb = String(b.symbol || '').trim(), issuer = String(b.issuer || '').trim(), qt = b.quote === 'XRP' ? XRP : RLUSD;
     if (!symb || !xrpl.isValidClassicAddress(issuer)) throw new Error('need a currency code and a valid issuer address');
@@ -641,7 +676,7 @@ const routes = {
   'POST /api/send': async (b) => locked(async () => {
     if (!wallet) throw new Error('No wallet connected'); if (MOCK) throw new Error('mock mode');
     if (b.confirm !== true) throw new Error('Not confirmed');
-    if (P.pos || P.pend) throw new Error('Close the open position / cancel the pending entry first: sending funds would break its accounting');
+    if (Object.values(state.pairs || {}).some(q => q && (q.pos || q.pend))) throw new Error('Close open positions / cancel pending entries (all pairs) first: sending funds would break their accounting');
     const to = String(b.to || '').trim(); if (!xrpl.isValidClassicAddress(to)) throw new Error('Invalid destination address'); if (to === wallet.address) throw new Error('Destination is this wallet');
     const n = num(b.amount, 'amount'), cur = String(b.currency || 'XRP'), w = await walletData(); let Amount;
     if (cur === 'XRP') { if (n > w.spendable + 1e-9) throw new Error(`Only ${w.spendable.toFixed(4)} XRP is spendable (reserve + buffer held back)`); Amount = xrpl.xrpToDrops(n.toFixed(6)); }

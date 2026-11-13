@@ -27,3 +27,6 @@ Trades and the equity history are saved in history.json (with history.bak.json a
 
 ## Smart Auto brain (v3.0, ON by default)
 25 safeguards (regime score gate, counter-trend veto, cost/liquidity/divergence/stale-data guards, learned sizing, adaptive exits, auto re-tune and more) run on every automatic entry. Each can be switched off in the Smart tab. Manual Buy/Short bypass it. It reduces bad entries; it cannot guarantee profit.
+
+## Simultaneous pairs + GateHub BTC (v3.1)
+BTC/XRP (GateHub BTC, issuer rchGBxcD1A1C2tdxF6papQYZ8kjRKMYcL) is built in. On the Trade tab, each pair card has a TRADING/OFF switch: every pair that is ON runs its own signals, orders, stops and analytics at the same time on the one wallet. Add the BTC trust line on the Wallet tab first (one click). Pairs share XRP, so BTC/XRP defaults to 50% of the wallet; adjust per pair with the allocation control. Fills are now read from each transaction's own metadata, so one pair's trades never distort another's accounting. Send/receive works for any asset with a trust line.
