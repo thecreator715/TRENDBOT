@@ -74,19 +74,25 @@ function loadPair() {
 // Seed the chart with ~16h of 1-minute history (XRP/USD, Bitstamp public API) so it isn't empty at start. XRP/RLUSD only; other pairs build live from ticks.
 async function backfill() {
   const P0 = P, pid = pair.id;
-  if (MOCK || pid !== 'XRP/RLUSD' || P0.ticks.length > 200) return;
+  P0.bfAt = Date.now();
+  if (MOCK || P0.ticks.length > 200 || (pid !== 'XRP/RLUSD' && pid !== 'BTC/XRP')) { P0.bfDone = true; return; }
   try {
-    const r = await fetch('https://www.bitstamp.net/api/v2/ohlc/xrpusd/?step=60&limit=1000');
-    const j = await r.json(), bars = (j.data && j.data.ohlc) || [];
-    const first = P0.ticks.length ? P0.ticks[0][0] : Infinity, h = [];
-    for (const b of bars) {
-      const t = +b.timestamp * 1000; if (t >= first) continue;
-      const o = +b.open, hi = +b.high, lo = +b.low, c = +b.close, up = c >= o;
-      h.push([t, o], [t + 15000, up ? lo : hi], [t + 30000, up ? hi : lo], [t + 45000, c]);
+    const base = process.env.TB_OHLC || 'https://www.bitstamp.net/api/v2/ohlc/', get = async m => ((await (await fetch(`${base}${m}/?step=60&limit=1000`)).json()).data || {}).ohlc || [];
+    let bars;
+    if (pid === 'XRP/RLUSD') bars = (await get('xrpusd')).map(b => ({ t: +b.timestamp * 1000, o: +b.open, h: +b.high, l: +b.low, c: +b.close }));
+    else { // BTC/XRP = BTC/USD divided by XRP/USD, minute by minute
+      const [bt, xr] = await Promise.all([get('btcusd'), get('xrpusd')]), xm = new Map(xr.map(x => [x.timestamp, x]));
+      bars = []; for (const q of bt) { const x = xm.get(q.timestamp); if (!x) continue; const xo = +x.open, xc = +x.close, xa = (xo + xc) / 2; if (!(xa > 0)) continue;
+        const o = +q.open / xo, c = +q.close / xc; bars.push({ t: +q.timestamp * 1000, o, c, h: Math.max(o, c, +q.high / xa), l: Math.min(o, c, +q.low / xa) }); }
     }
-    if (h.length < 100 || P !== P0) return;
-    P0.ticks = h.concat(P0.ticks); candles = S.buildCandles(P0.ticks, cfg.timeframeMinutes);
-    addLog('info', `chart seeded with ${bars.length} minutes of XRP history`);
+    const first = P0.ticks.length ? P0.ticks[0][0] : Infinity, h = [];
+    for (const k of bars) {
+      if (k.t >= first || !(k.o > 0) || !(k.c > 0)) continue;
+      const up = k.c >= k.o; h.push([k.t, k.o], [k.t + 15000, up ? k.l : k.h], [k.t + 30000, up ? k.h : k.l], [k.t + 45000, k.c]);
+    }
+    if (h.length < 100) return;
+    P0.ticks = h.concat(P0.ticks); P0.reseed = true; P0.bfDone = true; // candles are rebuilt from the ticks at the next tick of this pair
+    addLog('info', `chart seeded with ${bars.length} minutes of ${pid} history`);
   } catch (e) { log('history backfill skipped:', e.message); }
 }
 function save() {
@@ -437,6 +443,8 @@ let last = { px: null, sig: { trend: 'NONE', why: 'warming up' }, err: null };
 const equityOf = (b, px) => b.quote + b.base * px;
 async function tickBody() {
   try {
+    if (!P.bfDone && P.ticks.length <= 200 && Date.now() - (P.bfAt || 0) > 120000) { P.bfAt = Date.now(); backfill(); }
+    if (P.reseed || candles.tf !== cfg.timeframeMinutes * 60000) { P.reseed = false; candles = S.buildCandles(P.ticks, cfg.timeframeMinutes); P.marks = P.marks || []; }
     const px = await price(); last.px = px; last.err = null; last.at = Date.now(); errRun = 0;
     const now = Date.now();
     try { await dexWicks(pair, px); } catch (e) { last.dexErr = e.message; }
@@ -567,7 +575,7 @@ const view = () => {
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
     active: state.active || [pair.id], multi: pairs.map(p => { const q = state.pairs[p.id] || {}, c = p.id === pair.id ? { last } : (ctxMap[p.id] || {}), l = c.last || {}; return { id: p.id, on: (state.active || []).includes(p.id), side: q.pos ? q.pos.side : null, px: l.px ?? null, err: l.err || null, trades: hist.trades.filter(t => t.pair === p.id).length, pnl: +hist.trades.filter(t => t.pair === p.id).reduce((a, t) => a + (t.pnl || 0), 0).toFixed(6), open: q.pos ? +(q.pos.side === 'SHORT' ? q.pos.cost - q.pos.base * (l.px || 0) : q.pos.base * (l.px || 0) - q.pos.cost).toFixed(6) : 0, quote: sym(p.quote.currency) }; }),
-    ver: 3.1, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 3.2, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
