@@ -107,7 +107,8 @@ class Brain {
       const hg = this.hour[nowH]; if (on('hourlearn') && hg && hg.n >= 8 && hg.r / hg.n < -0.3) return veto('hourlearn', `${nowH}:00 UTC averages ${(hg.r / hg.n).toFixed(2)}R`);
       if (on('volspike')) { if (E.vr > 3.5) return veto('volspike', `volatility ${E.vr.toFixed(1)}x normal`); if (E.vr > 2.2) { size *= 0.7; this.hit('volspike'); notes.push('vol x0.7'); } }
       const spreadPct = snap.ask && snap.bid ? (snap.ask - snap.bid) / px * 100 : 0;
-      if (on('cost') && E.atrPct < 2 * spreadPct + 0.06) return veto('cost', `range ${E.atrPct.toFixed(3)}% below costs ${(2 * spreadPct + 0.06).toFixed(3)}%`);
+      const feePct = (snap.feePct || 0), costPct = spreadPct + 2 * feePct + 0.02, rewardPct = (risk / px * 100) * (cfg.takeProfitR || 2);
+      if (on('cost') && rewardPct < 1.5 * costPct) return veto('cost', `target ${rewardPct.toFixed(3)}% < 1.5x costs ${costPct.toFixed(3)}% (spread ${spreadPct.toFixed(3)}% + issuer fee ${feePct.toFixed(3)}%x2)`);
       if (on('sr')) { if (long && E.res && E.res.p > px && E.res.p - px < risk) return veto('sr', `resistance ${E.res.p.toPrecision(5)} inside 1R`); if (!long && E.sup && E.sup.p < px && px - E.sup.p < risk) return veto('sr', `support ${E.sup.p.toPrecision(5)} inside 1R`); }
       if (on('mtf')) { try { const h = STRAT.aggregate(closed, null, 3); if (h.length >= 26) { const H = this.engine(cfg).engine(h, px); if (H && H.er > 0.45 && ((long && H.name === 'TREND DOWN') || (!long && H.name === 'TREND UP'))) return veto('mtf', `3x timeframe is ${H.name}`); } } catch {} }
       if (on('confsize')) { const m = Math.max(0.6, Math.min(1.3, 0.6 + (score - 50) / 70)) * (E.name === 'VOLATILE' ? 0.6 : 1); size *= m; notes.push('conf x' + m.toFixed(2)); }

@@ -35,3 +35,10 @@ ETH/XRP (GateHub ETH, issuer rcA8X3TVMST1n3CJeAdGk1RdRCHii7N2h) is built in too,
 
 ## v3.4 request-rate and robustness
 All pairs share one wallet snapshot, one offers list and one book_changes read per ledger, cutting XRPL requests to roughly half with three pairs (public servers rate-limit); on a rate-limit error the bot pauses 8s and fails over to the next server. Wallets with more than 400 trust lines are paged. The wallet equity history is thinned automatically so history.json stays small.
+
+## v3.5 - "not entering trades" fixes
+- Smart cost guard now compares the real target (stop distance x takeProfitR) with real costs (spread + issuer transfer fee x2), instead of ATR vs 2x spread, which blocked almost everything in calm markets.
+- Always-in pause relaxed to range < 1x spread.
+- Issuer TransferRate is read from the issuer account (cached 10 min). Sells of issued assets are capped at balance/(1+fee), the fee is part of the cost guard, and it shows on the pair card.
+- Each pair card shows "Waiting: <reason>" (Smart veto, no trust line, always-in pause) so you can see why nothing is entering.
+- Tested on a fake XRPL only. Stops are polled, not on-ledger. No bot can promise it never loses.

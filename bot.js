@@ -181,6 +181,13 @@ async function getOffers(force) {
   offP = (async () => { const r = await client.request({ command: 'account_offers', account: wallet.address, limit: 200 }); offRaw = r.result.offers || []; offRawAt = Date.now(); return offRaw; })().finally(() => { offP = null; });
   return offP;
 }
+const feeCache = {};
+async function issuerFee(a) {
+  if (!a || !a.issuer || a.currency === 'XRP') return 0;
+  const c = feeCache[a.issuer]; if (c && Date.now() - c.t < 600000) return c.v;
+  try { const r = await client.request({ command: 'account_info', account: a.issuer, ledger_index: 'validated' }); const tr = Number(r.result.account_data.TransferRate || 0), v = tr > 1e9 ? (tr / 1e9 - 1) * 100 : 0; feeCache[a.issuer] = { v, t: Date.now() }; return v; }
+  catch (e) { feeCache[a.issuer] = { v: c ? c.v : 0, t: Date.now() - 540000 }; return c ? c.v : 0; }
+}
 async function walletData(fresh) {
   if (!fresh && wdC && Date.now() - wdAt < 1500) return wdC;
   if (wdP) return wdP;
@@ -358,15 +365,15 @@ async function openLimit(long, px, stop, target, amt, why) {
   addLog('info', `LIMIT ${long ? 'BUY' : 'SELL-SHORT'} ${baseAmt.toFixed(4)} ${sym(pair.base.currency)} @ ${lp.toPrecision(6)} resting on the book (timeout ${cfg.limitTimeoutSec}s)`);
   return true;
 }
-function brainSnap() { const src = last.src || {}; return { ask: last.ask, bid: last.bid, amm: src.amm, bookBid: src.bookBid, bookAsk: src.bookAsk, depthAsk: src.depthAsk, depthBid: src.depthBid, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, tickAgeMs: last.priceAt ? Date.now() - last.priceAt : 0, ledgerAgeMs: last.ledgerAt ? Date.now() - last.ledgerAt : 0 }; }
+function brainSnap() { const src = last.src || {}; return { ask: last.ask, bid: last.bid, amm: src.amm, bookBid: src.bookBid, bookAsk: src.bookAsk, depthAsk: src.depthAsk, depthBid: src.depthBid, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, tickAgeMs: last.priceAt ? Date.now() - last.priceAt : 0, ledgerAgeMs: last.ledgerAt ? Date.now() - last.ledgerAt : 0, feePct: (P.feePct || 0) }; }
 const ecfg = () => (cfg.smart !== false ? { ...cfg, ...brain.acfg } : cfg);
 let lastVeto = '', lastVetoAt = 0;
 async function enter(long, px, stop, target, amt, why) {
   if (!tradeOK) return false;
   if (cfg.smart !== false) {
     const d = brain.evaluate({ long, px, stop, closed: candles.closed, cfg, snap: brainSnap(), sess: { consec: P.consec || 0, ddPct: last.ddPct || 0 }, relaxed: /^always-in/.test(why), orderQuote: long ? amt : amt * px });
-    if (!d.ok) { if (d.why !== lastVeto || Date.now() - lastVetoAt > 60000) { lastVeto = d.why; lastVetoAt = Date.now(); addLog('info', `SMART skipped ${long ? 'long' : 'short'}: ${d.why}`); } return false; }
-    const avail = balC ? (long ? balC.quote : balC.base) : Infinity; amt = Math.min(amt * d.size, avail * 0.98);
+    if (!d.ok) { if (d.why !== lastVeto || Date.now() - lastVetoAt > 60000) { lastVeto = d.why; lastVetoAt = Date.now(); addLog('info', `SMART skipped ${long ? 'long' : 'short'}: ${d.why}`); } last.veto = `Smart skipped ${long ? 'long' : 'short'}: ${d.why}`; last.vetoAt = Date.now(); return false; }
+    const avail = balC ? (long ? balC.quote : balC.base / (1 + (P.feePct || 0) / 100)) : Infinity; amt = Math.min(amt * d.size, avail * 0.98);
     if ((long ? amt : amt * px) < cfg.minTradeQuote) return false;
     P.nextOv = d.ov; P.nextReg = d.reg; why = why + ` [smart ${d.reg} ${Math.round(d.score)} x${d.size.toFixed(2)}]`;
   } else { P.nextOv = null; P.nextReg = null; }
@@ -458,6 +465,7 @@ async function tickBody() {
     if (refG) { last.ref = refG.px; last.refAt = refG.at; }
     if (!P.bfDone && P.ticks.length <= 200 && Date.now() - (P.bfAt || 0) > 120000) { P.bfAt = Date.now(); backfill(); }
     if (P.reseed || candles.tf !== cfg.timeframeMinutes * 60000) { P.reseed = false; candles = S.buildCandles(P.ticks, cfg.timeframeMinutes); P.marks = P.marks || []; }
+    P.feePct = await issuerFee(pair.base); last.fee = P.feePct;
     const px = await price(); last.px = px; last.err = null; last.at = Date.now(); errRun = 0;
     const now = Date.now();
     try { await dexWicks(pair, px); } catch (e) { last.dexErr = e.message; }
@@ -538,7 +546,7 @@ async function tickBody() {
           const up = score > 0 ? true : score < 0 ? false : px >= c2.close;
           // cost guard: expected candle range must clearly exceed the round-trip spread, otherwise fees/spread eat the edge
           const spreadPct = last.ask && last.bid ? (last.ask - last.bid) / px * 100 : 0;
-          if (ctx.atrPct != null && ctx.atrPct < 2 * spreadPct) { if (Date.now() - (last.noteAt || 0) > 60000) { last.noteAt = Date.now(); addLog('info', `always-in paused: range ${ctx.atrPct.toFixed(3)}% < 2x spread ${spreadPct.toFixed(3)}%`); } } else {
+          if (ctx.atrPct != null && ctx.atrPct < 1 * spreadPct) { last.veto = `always-in paused: range ${ctx.atrPct.toFixed(3)}% < spread ${spreadPct.toFixed(3)}%`; last.vetoAt = Date.now(); if (Date.now() - (last.noteAt || 0) > 60000) { last.noteAt = Date.now(); addLog('info', `always-in paused: range ${ctx.atrPct.toFixed(3)}% < spread ${spreadPct.toFixed(3)}%`); } } else {
           const can = (long) => { const lv = long ? last.plan.long : last.plan.short, A = autoLv({ stop: lv.stop, target: lv.target, stopPct: 0 }, px, long), u = useFrac(), rs = S.riskScale(P.consec, cfg);
             const q = long ? S.sizeQuote(e * u, Math.min(b.quote, e * u), A.stopPct, cfg, rs) : S.sizeShortBase(e * u, px, A.stop, b.base, cfg, rs);
             return { A, q, ok: long ? q >= cfg.minTradeQuote : q * px >= cfg.minTradeQuote }; };
@@ -590,8 +598,8 @@ const view = () => {
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
     tradesAll: hist.trades.slice(-3000).map(t => ({ t: t.t, ts: t.t, pair: t.pair, side: t.side, pnl: t.pnl })),
-    active: state.active || [pair.id], multi: pairs.map(p => { const q = state.pairs[p.id] || {}, c = p.id === pair.id ? { last } : (ctxMap[p.id] || {}), l = c.last || {}; return { id: p.id, on: (state.active || []).includes(p.id), side: q.pos ? q.pos.side : null, px: l.px ?? null, err: l.err || null, trades: hist.trades.filter(t => t.pair === p.id).length, pnl: +hist.trades.filter(t => t.pair === p.id).reduce((a, t) => a + (t.pnl || 0), 0).toFixed(6), pos: q.pos ? { side: q.pos.side, base: q.pos.base, entry: q.pos.entry, stop: q.pos.stop, target: q.pos.target || null, bsym: sym(p.base.currency), risk: q.pos.risk || null } : null, open: q.pos ? +(q.pos.side === 'SHORT' ? q.pos.cost - q.pos.base * (l.px || 0) : q.pos.base * (l.px || 0) - q.pos.cost).toFixed(6) : 0, quote: sym(p.quote.currency) }; }),
-    ver: 3.4, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    active: state.active || [pair.id], multi: pairs.map(p => { const q = state.pairs[p.id] || {}, c = p.id === pair.id ? { last } : (ctxMap[p.id] || {}), l = c.last || {}; return { id: p.id, fee: +(l.fee || 0).toFixed(4), why: (Date.now() - (l.vetoAt || 0) < 180000 ? l.veto : null) || l.noTrust || null, on: (state.active || []).includes(p.id), side: q.pos ? q.pos.side : null, px: l.px ?? null, err: l.err || null, trades: hist.trades.filter(t => t.pair === p.id).length, pnl: +hist.trades.filter(t => t.pair === p.id).reduce((a, t) => a + (t.pnl || 0), 0).toFixed(6), pos: q.pos ? { side: q.pos.side, base: q.pos.base, entry: q.pos.entry, stop: q.pos.stop, target: q.pos.target || null, bsym: sym(p.base.currency), risk: q.pos.risk || null } : null, open: q.pos ? +(q.pos.side === 'SHORT' ? q.pos.cost - q.pos.base * (l.px || 0) : q.pos.base * (l.px || 0) - q.pos.cost).toFixed(6) : 0, quote: sym(p.quote.currency) }; }),
+    ver: 3.5, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
