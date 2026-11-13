@@ -144,7 +144,8 @@ async function bookBest(p) {
 // Field formats vary by server, so every candidate scaling is checked against the executable mid and only accepted within 5%.
 async function dexWicks(p, mid) {
   if (MOCK || !client) return;
-  const r = await client.request({ command: 'book_changes', ledger_index: 'validated' });
+  if (!bcC || Date.now() - bcAt > 2500) { if (!bcP) bcP = client.request({ command: 'book_changes', ledger_index: 'validated' }).then(x => { bcC = x; bcAt = Date.now(); }).finally(() => { bcP = null; }); await bcP; }
+  const r = bcC; if (!r) return;
   const L = r.result.ledger_index; if (L === last.bcLedger) return; last.bcLedger = L;
   const want = [p.base, p.quote].map(a => isXRP(a) ? 'XRP' : a.issuer);
   const e = (r.result.changes || []).find(c => { const k = String(c.currency_a) + '|' + String(c.currency_b); return want.every(w => k.includes(w)); });
@@ -172,21 +173,29 @@ async function price() {
   last.ask = ask; last.bid = bid; last.src = { amm: A ? A.spot : null, bookAsk: B ? B.ask : null, bookBid: B ? B.bid : null, nA: B ? B.nA : 0, nB: B ? B.nB : 0, depthAsk: B ? B.depthAsk : 0, depthBid: B ? B.depthBid : 0 }; last.priceAt = Date.now();
   return v;
 }
-async function walletData() {
-  const [info, lines, srv, offers] = await Promise.all([
-    client.request({ command: 'account_info', account: wallet.address, ledger_index: 'current' }),
-    client.request({ command: 'account_lines', account: wallet.address, ledger_index: 'current', limit: 400 }),
-    client.request({ command: 'server_info' }),
-    client.request({ command: 'account_offers', account: wallet.address, limit: 50 }),
-  ]);
-  const vl = srv.result.info.validated_ledger || {}, owner = info.result.account_data.OwnerCount || 0, rb = Number(vl.reserve_base_xrp ?? 1), ri = Number(vl.reserve_inc_xrp ?? 0.2);
-  const reserve = rb + ri * owner;
-  const bal = Number(info.result.account_data.Balance) / 1e6;
-  return {
-    address: wallet.address, xrp: bal, reserve, reserveBase: rb, reserveInc: ri, spendable: Math.max(0, bal - reserve - cfg.xrpReserveBuffer), owner,
-    lines: lines.result.lines.map(l => ({ currency: sym(l.currency), raw: l.currency, issuer: l.account, balance: Number(l.balance), limit: Number(l.limit) })),
-    offers: offers.result.offers.length,
-  };
+// ---- shared, de-duplicated wallet reads (all pairs trade one wallet: ask the network once, not once per pair) ----
+let wdC = null, wdAt = 0, wdP = null, srvC = null, srvAt = 0, offRaw = null, offRawAt = 0, offP = null, bcC = null, bcAt = 0, bcP = null;
+async function getOffers(force) {
+  if (!force && offRaw && Date.now() - offRawAt < 2500) return offRaw;
+  if (offP) return offP;
+  offP = (async () => { const r = await client.request({ command: 'account_offers', account: wallet.address, limit: 200 }); offRaw = r.result.offers || []; offRawAt = Date.now(); return offRaw; })().finally(() => { offP = null; });
+  return offP;
+}
+async function walletData(fresh) {
+  if (!fresh && wdC && Date.now() - wdAt < 1500) return wdC;
+  if (wdP) return wdP;
+  wdP = (async () => {
+    if (!srvC || Date.now() - srvAt > 60000) { srvC = (await client.request({ command: 'server_info' })).result.info.validated_ledger || srvC || {}; srvAt = Date.now(); }
+    const [info, offers] = await Promise.all([client.request({ command: 'account_info', account: wallet.address, ledger_index: 'current' }), getOffers(!!fresh)]);
+    let lines = [], marker, pages = 0;
+    do { const r = await client.request({ command: 'account_lines', account: wallet.address, ledger_index: 'current', limit: 400, ...(marker ? { marker } : {}) }); lines = lines.concat(r.result.lines); marker = r.result.marker; } while (marker && ++pages < 5);
+    const vl = srvC || {}, owner = info.result.account_data.OwnerCount || 0, rb = Number(vl.reserve_base_xrp ?? 1), ri = Number(vl.reserve_inc_xrp ?? 0.2);
+    const reserve = rb + ri * owner, bal = Number(info.result.account_data.Balance) / 1e6;
+    const w = { address: wallet.address, xrp: bal, reserve, reserveBase: rb, reserveInc: ri, spendable: Math.max(0, bal - reserve - cfg.xrpReserveBuffer), owner,
+      lines: lines.map(l => ({ currency: sym(l.currency), raw: l.currency, issuer: l.account, balance: Number(l.balance), limit: Number(l.limit) })), offers: offers.length };
+    wdC = w; wdAt = Date.now(); return w;
+  })().finally(() => { wdP = null; });
+  return wdP;
 }
 async function walletTx() {
   const r = await client.request({ command: 'account_tx', account: wallet.address, limit: 12 });
@@ -210,7 +219,8 @@ async function balances() {
 
 // ---------- execution ----------
 let txQ = Promise.resolve();
-const sub = (tx, opts) => { const run = () => client.submitAndWait(tx, opts); const p = txQ.then(run, run); txQ = p.catch(() => {}); return p; }; // one transaction at a time: no sequence clashes between a cancel and a tick's order
+const dropWalletCache = () => { wdAt = 0; offRawAt = 0; };
+const sub = (tx, opts) => { const run = () => client.submitAndWait(tx, opts).finally(dropWalletCache); const p = txQ.then(run, run); txQ = p.catch(() => {}); return p; }; // one transaction at a time: no sequence clashes between a cancel and a tick's order
 const amount = (a, v) => (isXRP(a) ? xrpl.xrpToDrops(Number(v).toFixed(6)) : { currency: a.currency, issuer: a.issuer, value: Number(v).toPrecision(12) });
 async function swap(side, amountIn, px, slipPct) {
   balAt = 0;
@@ -426,8 +436,8 @@ const amtOf = x => (typeof x === 'string' ? { cur: 'XRP', v: Number(x) / 1e6, is
 const isAsset = (x, a) => (isXRP(a) ? x.cur === 'XRP' : x.cur === a.currency && x.iss === a.issuer);
 async function refreshOffers(force) {
   if (!wallet || MOCK || !client || (!force && Date.now() - offAt < 5000)) return; offAt = Date.now();
-  const r = await client.request({ command: 'account_offers', account: wallet.address, limit: 200 });
-  offC = (r.result.offers || []).map(o => { const g = amtOf(o.taker_gets), p = amtOf(o.taker_pays);
+  const raw = await getOffers(!!force);
+  offC = raw.map(o => { const g = amtOf(o.taker_gets), p = amtOf(o.taker_pays);
     if (isAsset(g, pair.base) && isAsset(p, pair.quote)) return { seq: o.seq, side: 'SELL', price: p.v / g.v, base: g.v, quote: p.v, passive: !!((o.flags || 0) & 0x10000) };
     if (isAsset(g, pair.quote) && isAsset(p, pair.base)) return { seq: o.seq, side: 'BUY', price: g.v / p.v, base: p.v, quote: g.v, passive: !!((o.flags || 0) & 0x10000) };
     return null; }).filter(Boolean);
@@ -442,8 +452,10 @@ async function xuNow(px) {
 // ---------- main tick ----------
 let last = { px: null, sig: { trend: 'NONE', why: 'warming up' }, err: null };
 const equityOf = (b, px) => b.quote + b.base * px;
+let refG = null;
 async function tickBody() {
   try {
+    if (refG) { last.ref = refG.px; last.refAt = refG.at; }
     if (!P.bfDone && P.ticks.length <= 200 && Date.now() - (P.bfAt || 0) > 120000) { P.bfAt = Date.now(); backfill(); }
     if (P.reseed || candles.tf !== cfg.timeframeMinutes * 60000) { P.reseed = false; candles = S.buildCandles(P.ticks, cfg.timeframeMinutes); P.marks = P.marks || []; }
     const px = await price(); last.px = px; last.err = null; last.at = Date.now(); errRun = 0;
@@ -465,7 +477,7 @@ async function tickBody() {
     if (walC) { const tot = a => isXRP(a) ? walC.xrp : ((walC.lines.find(x => x.raw === a.currency && x.issuer === a.issuer) || {}).balance || 0); last.eqAll = tot(pair.quote) + tot(pair.base) * px; last.xrpTotal = walC.xrp;
       const ev = last.eqAll;
       if (ev > 0 && !hist.base[pair.id]) hist.base[pair.id] = { t: Date.now(), eq: ev };
-      if (!hist.lastEqT || Date.now() - hist.lastEqT >= 30000) { hist.lastEqT = Date.now(); hist.eq.push([Date.now(), +ev.toFixed(6), pair.id]); saveHist(); } }
+      if (!hist.lastEqT || Date.now() - hist.lastEqT >= 30000) { hist.lastEqT = Date.now(); hist.eq.push([Date.now(), +ev.toFixed(6), pair.id]); if (hist.eq.length > 14000) { const keep = hist.eq.slice(-6000), old = hist.eq.slice(0, -6000).filter((_, i) => i % 6 === 0); hist.eq = old.concat(keep); } saveHist(); } }
     const dk = new Date().toISOString().slice(0, 10);
     if (dk !== dayKey) { dayKey = dk; startEq = e; P.tradesToday = 0; P.dayPnl = 0; P.goalHit = false; if (state.halted && /daily goal/.test(state.halted)) state.halted = null; }
     eq.push(e); if (eq.length > 600) eq.shift();
@@ -540,7 +552,7 @@ async function tickBody() {
       }
     }
     save();
-  } catch (err) { last.err = err.message; log('tick error:', err.message); if (!MOCK && ++errRun >= 4) rotateServer(); }
+  } catch (err) { last.err = err.message; log('tick error:', err.message); if (/slowDown|tooBusy|rate.?limit|429/i.test(String(err.message || err.data || ''))) { backoffUntil = Date.now() + 8000; log('server is rate-limiting: pausing 8s'); } if (!MOCK && ++errRun >= 4) rotateServer(); }
 }
 // ---------- simultaneous pairs: every active pair runs its own tick, one after another, by swapping the per-pair runtime in and out ----------
 const ctxMap = {}; let viewPair = null;
@@ -553,9 +565,11 @@ function loadCtx(id) {
   if (P.use == null && (pair.id === 'BTC/XRP' || pair.id === 'ETH/XRP')) P.use = 40;
 }
 const activeIds = () => { const s = new Set([pair.id, ...(state.active || [pair.id])]); for (const id of Object.keys(state.pairs || {})) if (state.pairs[id] && (state.pairs[id].pos || state.pairs[id].pend) && pairById(id)) s.add(id); return [...s].filter(id => pairById(id)); };
+let cycleAt = 0, backoffUntil = 0;
 async function tick() {
+  if (Date.now() < backoffUntil || Date.now() - cycleAt < 1800) return;
   if (busy) { if (Date.now() - busySince > 90000) { log('watchdog: tick was stuck for 90s, resetting'); busy = false; } else return; } busy = true; busySince = Date.now();
-  const view0 = pair.id; viewPair = view0;
+  cycleAt = Date.now(); const view0 = pair.id; viewPair = view0;
   try {
     for (const id of activeIds()) {
       if (pair.id !== id) { ctxMap[pair.id] = snapCtx(); loadCtx(id); }
@@ -575,8 +589,9 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
+    tradesAll: hist.trades.slice(-3000).map(t => ({ t: t.t, ts: t.t, pair: t.pair, side: t.side, pnl: t.pnl })),
     active: state.active || [pair.id], multi: pairs.map(p => { const q = state.pairs[p.id] || {}, c = p.id === pair.id ? { last } : (ctxMap[p.id] || {}), l = c.last || {}; return { id: p.id, on: (state.active || []).includes(p.id), side: q.pos ? q.pos.side : null, px: l.px ?? null, err: l.err || null, trades: hist.trades.filter(t => t.pair === p.id).length, pnl: +hist.trades.filter(t => t.pair === p.id).reduce((a, t) => a + (t.pnl || 0), 0).toFixed(6), pos: q.pos ? { side: q.pos.side, base: q.pos.base, entry: q.pos.entry, stop: q.pos.stop, target: q.pos.target || null, bsym: sym(p.base.currency), risk: q.pos.risk || null } : null, open: q.pos ? +(q.pos.side === 'SHORT' ? q.pos.cost - q.pos.base * (l.px || 0) : q.pos.base * (l.px || 0) - q.pos.cost).toFixed(6) : 0, quote: sym(p.quote.currency) }; }),
-    ver: 3.3, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 3.4, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
@@ -720,7 +735,7 @@ const server = http.createServer(async (req, res) => {
     const url = req.url.split('?')[0];
     if (req.method === 'GET' && (url === '/' || url === '/index.html')) return send(200, fs.readFileSync(F('ui.html'), 'utf8'), 'text/html; charset=utf-8');
     const h = routes[`${req.method} ${url}`];
-    if (!h) return send(404, { error: 'not found' });
+    if (!h) { if (req.url === '/favicon.ico') { res.writeHead(204); return res.end(); } return send(404, { error: 'not found' }); }
     if (req.method === 'POST') {
       const o = req.headers.origin; // block other websites from driving the bot
       if (req.headers['x-tb'] !== '1' || (o && o !== `http://${host}`)) return send(403, { error: 'forbidden' });
@@ -747,7 +762,7 @@ async function rotateServer() {
 }
 // Independent reference price (Bitstamp XRP/USD, RLUSD ~ $1): only flags a bad feed, never traded on.
 async function refPrice() {
-  try { const r = await fetch('https://www.bitstamp.net/api/v2/ticker/xrpusd/'); const j = await r.json(); last.ref = Number(j.last); last.refAt = Date.now(); } catch (e) { last.refErr = e.message; }
+  try { const r = await fetch('https://www.bitstamp.net/api/v2/ticker/xrpusd/'); const j = await r.json(); refG = { px: Number(j.last), at: Date.now() }; last.ref = refG.px; last.refAt = refG.at; } catch (e) { last.refErr = e.message; }
 }
 async function main() {
   if (process.env.BOT_SEED) { wallet = xrpl.Wallet.fromSeed(process.env.BOT_SEED.trim()); delete process.env.BOT_SEED; }
