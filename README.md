@@ -50,3 +50,10 @@ All pairs share one wallet snapshot, one offers list and one book_changes read p
 - Always-in pauses only if the range is under half the spread (`alwaysInMinRangeX`).
 - A trend flip closes the position and reverses straight away (`flipReverse`).
 - Tested on a fake XRPL only. Faster entries mean more trades and more spread/fee cost; stops are polled, not on-ledger.
+
+## v3.7 - BTC/ETH pricing and trading like XRP/RLUSD
+- Per-pair Bitstamp reference (BTC/XRP = BTCUSD/XRPUSD, ETH/XRP = ETHUSD/XRPUSD). Each pair card shows the spread and the deviation from it; the Smart safety check now covers BTC and ETH too.
+- Chart history seeded from Bitstamp is re-based to the live GateHub price on the first live tick, so there is no step where history joins live data.
+- Always-in no longer pauses on wide spreads. On pairs with spread over 0.3% it enters with a patient resting limit (earns the spread instead of paying it).
+- Entries are blocked with a visible reason when the wallet has no trust line or the price is invalid (fixes a bogus "BUY @ Infinity").
+- Tested on a fake XRPL only. GateHub BTC/ETH books are thin; exits by stop still cross the spread.
