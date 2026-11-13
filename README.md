@@ -42,3 +42,11 @@ All pairs share one wallet snapshot, one offers list and one book_changes read p
 - Issuer TransferRate is read from the issuer account (cached 10 min). Sells of issued assets are capped at balance/(1+fee), the fee is part of the cost guard, and it shows on the pair card.
 - Each pair card shows "Waiting: <reason>" (Smart veto, no trust line, always-in pause) so you can see why nothing is entering.
 - Tested on a fake XRPL only. Stops are polled, not on-ledger. No bot can promise it never loses.
+
+## v3.6 - always in the market, faster
+- Default candle is now 1 minute (was 5), cooldown after a close is 0 candles, resting-order timeout 15s.
+- Always-in entries use a marketable order (no waiting on a resting limit), so a flat bot gets back in on the next tick.
+- The Smart brain keeps its safety checks (stale data, outside price check, AMM/book divergence, liquidity) but no longer blocks always-in entries on soft scoring rules (regime, counter-trend, cost, support/resistance, learned hours).
+- Always-in pauses only if the range is under half the spread (`alwaysInMinRangeX`).
+- A trend flip closes the position and reverses straight away (`flipReverse`).
+- Tested on a fake XRPL only. Faster entries mean more trades and more spread/fee cost; stops are polled, not on-ledger.

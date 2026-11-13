@@ -89,7 +89,7 @@ class Brain {
   // ---- the decision ----
   evaluate(inp) {
     const { long, px, stop, closed, cfg, snap = {}, sess = {}, relaxed, orderQuote } = inp, side = long ? 'long' : 'short', side2 = long ? 'LONG' : 'SHORT';
-    const on = id => this.on(cfg, id), veto = (id, why) => { this.hit(id); this.lastDecision = `${side} blocked · ${why}`; return { ok: false, why: `${FEATURES.find(f => f.id === id).name}: ${why}`, id }; };
+    const SOFT = new Set(['countertrend', 'regime', 'regimelearn', 'hourlearn', 'volspike', 'cost', 'sr', 'lossbar']), on = id => this.on(cfg, id) && !(relaxed && SOFT.has(id)), veto = (id, why) => { this.hit(id); this.lastDecision = `${side} blocked · ${why}`; return { ok: false, why: `${FEATURES.find(f => f.id === id).name}: ${why}`, id }; };
     if (cfg.smart === false) return { ok: true, size: 1, ov: null, reg: null };
     let size = 1, notes = [], ov = null, E = null, reg = '—', score = 50;
     const nowH = new Date().getUTCHours();
