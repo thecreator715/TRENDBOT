@@ -252,7 +252,7 @@ body.chartonly .colB,body.chartonly .colC{display:none!important}body.chartonly 
       <div class="row" style="margin-top:6px"><span class="k">Daily goal progress</span><b id="gGoal">off</b></div><div class="bar" id="gGoalbar"><i></i></div>
       <div class="row" style="margin-top:6px"><span class="k">Capital at risk</span><b id="gRisk">—</b></div>
       <div class="row"><span class="k">Consecutive losses</span><b id="gCL">0 / 3</b></div>
-      <div class="ctrl" style="margin-top:8px"><button class="kill" id="bKill">Kill switch</button><button id="bResume">Resume</button></div>
+      <div class="ctrl" style="margin-top:8px"><button class="kill" id="bKill">Kill switch</button><button id="bResume">Resume</button><button class="chip" id="bNever">Never halt: —</button></div>
       <h2 style="margin:10px 0 4px"><span>Underwater drawdown</span><span class="k" id="ddInfo"></span></h2><div class="grow"><canvas id="ddMini"></canvas></div>
     </div>
 
@@ -274,7 +274,7 @@ body.chartonly .colB,body.chartonly .colC{display:none!important}body.chartonly 
   <h2 style="margin-top:12px"><span>Place limit order</span><span class="k">rests on the XRPL book</span></h2>
   <div class="ctrl"><select id="lmSide"><option value="buy">Buy</option><option value="sell">Sell</option></select><input type="number" id="lmPx" placeholder="price" step="any" style="width:90px"><input type="number" id="lmAmt" placeholder="amount (base)" step="any" style="width:110px"><button class="primary" id="lmGo">Place</button></div>
   <h2 style="margin-top:12px"><span>Automatic orders</span><span class="k">bot places & manages these itself</span></h2><div id="autoOrd"></div>
-  <div class="note" id="autoPlan"></div>
+  <div class="note" id="autoPlan"></div><div class="note" id="orphNote"></div>
   <div class="note">Limit orders are real OfferCreate transactions on mainnet. They can fill partially, stay open until cancelled, and cost a reserve while open. The bot's own entries/exits use market-style IOC orders and are separate from these.</div>
 </div>
 <div class="pane" data-p="tools">
@@ -765,8 +765,9 @@ async function act(name,p={}){try{
   SIM[name](p);render();return{}}catch(e){toast(e.message);return null}}
 let _vw=0;
 async function poll(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)return;S=await r.json();Object.assign(cfg,S.cfg||{});
-  if(MODE==='live'){if(S.pairs&&$('pairSel').options.length!==S.pairs.length+1)fillPairs(S.pairs);const f=$('foot');if(f){if(!S.ver||S.ver<2.7)f.innerHTML='<b style="color:#ff8a9a">An OLD TRENDBOT is running (v'+(S.ver||'?')+', need 2.7). Close it: run STOP-TRENDBOT.command or Terminal: pkill -f "node bot.js" , then double-click START-TRENDBOT.command from the NEW unzipped folder.</b>';else if(S.note)f.innerHTML='<b style="color:#ffb84d">'+S.note+'</b>';else if(S.err)f.innerHTML='<b style="color:#ffb84d">Price feed error: '+S.err+'</b> · retrying';else f.textContent='Live · bot v'+S.ver+(S.bid&&S.ask?' · bid '+fp(S.bid)+' / ask '+fp(S.ask):'')+' · '+S.nTicks+' price ticks stored · DEX trades '+(S.dexN||0)+(S.dexErr?' (book_changes: '+String(S.dexErr).slice(0,40)+')':'')+(S.ledger?' · ledger #'+S.ledger:'')+(S.src?' · AMM '+(S.src.amm?fp(S.src.amm):'—')+' / book '+(S.src.bookBid?fp(S.src.bookBid):'—')+'–'+(S.src.bookAsk?fp(S.src.bookAsk):'—'):'')+(S.ref?' · Bitstamp XRP/USD '+fp(S.ref)+(S.refDev!=null?' ('+(S.refDev>=0?'+':'')+S.refDev.toFixed(2)+'%'+(Math.abs(S.refDev)>3?' ⚠ CHECK FEED':'')+')':''):'')+' · last tick '+(S.tickAt?Math.round((Date.now()-S.tickAt)/1000)+'s ago':'—')+' · stops are polled, not on-ledger.'}}
+  if(MODE==='live'){if(S.pairs&&$('pairSel').options.length!==S.pairs.length+1)fillPairs(S.pairs);const f=$('foot');if(f){if(!S.ver||S.ver<2.8)f.innerHTML='<b style="color:#ff8a9a">An OLD TRENDBOT is running (v'+(S.ver||'?')+', need 2.8). Close it: run STOP-TRENDBOT.command or Terminal: pkill -f "node bot.js" , then double-click START-TRENDBOT.command from the NEW unzipped folder.</b>';else if(S.note)f.innerHTML='<b style="color:#ffb84d">'+S.note+'</b>';else if(S.err)f.innerHTML='<b style="color:#ffb84d">Price feed error: '+S.err+'</b> · retrying';else f.textContent='Live · bot v'+S.ver+(S.bid&&S.ask?' · bid '+fp(S.bid)+' / ask '+fp(S.ask):'')+' · '+S.nTicks+' price ticks stored · DEX trades '+(S.dexN||0)+(S.dexErr?' (book_changes: '+String(S.dexErr).slice(0,40)+')':'')+(S.ledger?' · ledger #'+S.ledger:'')+(S.src?' · AMM '+(S.src.amm?fp(S.src.amm):'—')+' / book '+(S.src.bookBid?fp(S.src.bookBid):'—')+'–'+(S.src.bookAsk?fp(S.src.bookAsk):'—'):'')+(S.ref?' · Bitstamp XRP/USD '+fp(S.ref)+(S.refDev!=null?' ('+(S.refDev>=0?'+':'')+S.refDev.toFixed(2)+'%'+(Math.abs(S.refDev)>3?' ⚠ CHECK FEED':'')+')':''):'')+' · last tick '+(S.tickAt?Math.round((Date.now()-S.tickAt)/1000)+'s ago':'—')+' · stops are polled, not on-ledger.'}}
   if(MODE==='live'&&S.wal&&S.live)paintWallet({...S.wal,tx:S.wtx||[]});
+  {const nb=$('bNever');if(nb&&MODE==='live'){nb.textContent='Never halt: '+(cfg.runForever?'ON':'OFF');nb.classList.toggle('on',!!cfg.runForever)}else if(nb)nb.style.display='none'}
   render()}catch{}}
 
 // ================= canvas helpers =================
@@ -1139,7 +1140,7 @@ function autoOrdUI(){const el=$('autoOrd');if(!el||el.dataset.b||MODE!=='live')r
   $('aoMode').value=cfg.entryMode||'limit';$('aoMode').onchange=e=>act('config',{entryMode:e.target.value});
   el.querySelectorAll('[data-ao]').forEach(i=>{i.oninput=()=>$('ao_'+i.dataset.ao).textContent=i.value+i.dataset.u;i.onchange=()=>act('config',{[i.dataset.ao]:+i.value})});
   el.querySelectorAll('[data-aot]').forEach(b=>b.onclick=()=>act('config',{[b.dataset.aot]:!cfg[b.dataset.aot]}).then(()=>b.classList.toggle('on',!!cfg[b.dataset.aot])))}
-function ordersUI(){autoOrdUI();
+function ordersUI(){autoOrdUI();{const on=$('orphNote');if(on)on.innerHTML=MODE==='live'&&S.orphans>0?'<b style="color:#ffb84d">'+S.orphans+' open order(s) are not managed by the bot (leftovers or your own limits). Each locks 0.2 XRP of reserve. Use Cancel all to clear them.</b>':''}
   {const pl=S.plan,el=$('autoPlan');if(el)el.innerHTML=MODE==='live'&&pl?`<b>Auto plan</b> (updates every candle) · ${S.pend?'<span class="pos">limit entry resting ('+S.pend.age+'s)</span> · ':''}${S.autoOn?'auto ON':'auto OFF'} · shorts ${pl.shortsOn?'ON':'OFF'}<br>LONG on break above <b>${fp(pl.long.trigger)}</b> · stop ${fp(pl.long.stop)} · target ${fp(pl.long.target)}<br>SHORT on break below <b>${fp(pl.short.trigger)}</b> · stop ${fp(pl.short.stop)} · target ${fp(pl.short.target)}`:''}const live=MODE==='live';$('ordPair').textContent=S.pair||'—';
   $('ordNote').textContent=live?(S.live?'Open offers of the connected wallet on this pair (refreshes every few seconds).':'Connect a wallet on the Wallet page to see and place orders.'):'Simulator: real orders exist only in Live mode.';
   const o=live&&S.offers?S.offers:[];const act_=document.activeElement&&document.activeElement.closest&&document.activeElement.closest('#ordTbl');if(act_)return;
@@ -1253,7 +1254,7 @@ $('bConfirm').onclick=async()=>{const p=PLAN;if(!p)return;const r=await act(p.si
 $('bClose').onclick=()=>act('sell');$('bBE').onclick=()=>{if(S.pos)act('lines',{stop:S.pos.entry})};
 $('bTgt').onclick=()=>{if(!S.pos)return;if(S.pos.target)return act('lines',{target:null});const sh=S.pos.side==='SHORT',r=Math.abs(S.pos.entry-S.pos.stop)*Math.max(cfg.takeProfitR,1.5);act('lines',{target:sh?S.px-r:S.px+r})};
 $('bPlay').onclick=()=>{playing=!playing;$('bPlay').textContent=playing?'Pause':'Play'};
-$('bHedge').onclick=()=>act('hedge',{on:!S.hedgeOn});$('bAuto').onclick=()=>act('auto',{on:!S.autoOn});$('bShortOn').onclick=()=>act('shorton',{on:!S.shortOn});$('bKill').onclick=()=>act('kill');$('bResume').onclick=()=>act('resume');
+$('bHedge').onclick=()=>act('hedge',{on:!S.hedgeOn});$('bAuto').onclick=()=>act('auto',{on:!S.autoOn});$('bShortOn').onclick=()=>act('shorton',{on:!S.shortOn});$('bKill').onclick=()=>act('kill');$('bNever').onclick=()=>act('config',{runForever:!cfg.runForever});$('bResume').onclick=()=>act('resume');
 $('bReset').onclick=()=>{sims[S.pair]=newSim(S.pair);S=sims[S.pair];PLAN=null;ALERTS=[];PAN=0;render()};
 $('bLatest').onclick=()=>{PAN=0;drawChart()};$('zoom').oninput=e=>{VIS=+e.target.value;drawChart()};$('paneSel').onchange=e=>{PANE=e.target.value;drawChart()};
 document.querySelectorAll('.seg').forEach(b=>b.onclick=()=>{scenario=b.dataset.sc;document.querySelectorAll('.seg').forEach(s=>s.classList.toggle('on',s===b));if(S)S.regLeft=0});

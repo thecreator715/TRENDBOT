@@ -35,5 +35,6 @@
   "priceRefQuote": 100,
   "limitRepriceSec": 4,
   "runForever": true,
-  "hardFloorPct": 50
+  "hardFloorPct": 50,
+  "manualPauseCandles": 3
 }

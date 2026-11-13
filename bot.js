@@ -177,6 +177,8 @@ async function balances() {
 }
 
 // ---------- execution ----------
+let txQ = Promise.resolve();
+const sub = (tx, opts) => { const run = () => client.submitAndWait(tx, opts); const p = txQ.then(run, run); txQ = p.catch(() => {}); return p; }; // one transaction at a time: no sequence clashes between a cancel and a tick's order
 const amount = (a, v) => (isXRP(a) ? xrpl.xrpToDrops(Number(v).toFixed(6)) : { currency: a.currency, issuer: a.issuer, value: Number(v).toPrecision(12) });
 async function swap(side, amountIn, px, slipPct) {
   balAt = 0;
@@ -189,7 +191,7 @@ async function swap(side, amountIn, px, slipPct) {
   if (side === 'BUY') { gets = amount(pair.quote, amountIn); pays = amount(pair.base, amountIn / (px * (1 + slipPct / 100))); }
   else { gets = amount(pair.base, amountIn); pays = amount(pair.quote, amountIn * px * (1 - slipPct / 100)); }
   const before = await balances();
-  const res = await client.submitAndWait({ TransactionType: 'OfferCreate', Account: wallet.address, TakerGets: gets, TakerPays: pays, Flags: IOC }, { wallet, autofill: true });
+  const res = await sub({ TransactionType: 'OfferCreate', Account: wallet.address, TakerGets: gets, TakerPays: pays, Flags: IOC }, { wallet, autofill: true });
   const code = res.result.meta.TransactionResult;
   await sleep(1500);
   const after = await balances();
@@ -219,6 +221,13 @@ async function openShort(px, stop, target, qtyBase, why) {
   logTrade([new Date().toISOString(), pair.id, 'SHORT', wallet ? 'live' : 'paper', why, r.base.toFixed(6), r.quote.toFixed(6), r.price.toPrecision(8), '']);
   addLog('sell', `SHORT (sold ${r.base.toFixed(2)} ${sym(pair.base.currency)}) @ ${r.price.toPrecision(6)} · stop ${stop.toPrecision(6)}`);
   return true;
+}
+const pauseAuto = () => { P.cooldownUntil = Math.max(P.cooldownUntil || 0, Date.now() + (cfg.manualPauseCandles ?? 3) * cfg.timeframeMinutes * 60000); };
+async function closeAll(reason) { // manual exit: keeps retrying with wider slippage until flat, and stops the bot from instantly re-entering
+  let slip = cfg.stopSlippagePct, tries = 0, lastErr = '';
+  while (P.pos && tries < 5) { tries++; const px = await price(); try { await closePos(px, reason, slip); } catch (e) { lastErr = e.message; addLog('info', 'close attempt failed: ' + e.message); } if (P.pos) slip = Math.min(slip * 2, 15); }
+  pauseAuto();
+  if (P.pos) throw new Error('Could not close after ' + tries + ' tries' + (lastErr ? ': ' + lastErr : ' (no fill: check liquidity on the pair)'));
 }
 async function closePos(px, reason, slip, frac = 1) {
   const pos = P.pos, short = pos.side === 'SHORT';
@@ -257,7 +266,7 @@ async function placeLimit(side, baseAmt, price) {
   const qa = baseAmt * price;
   const gets = side === 'BUY' ? amount(pair.quote, qa) : amount(pair.base, baseAmt), pays = side === 'BUY' ? amount(pair.base, baseAmt) : amount(pair.quote, qa);
   const before = new Set(offC.map(o => o.seq));
-  const res = await client.submitAndWait({ TransactionType: 'OfferCreate', Account: wallet.address, TakerGets: gets, TakerPays: pays }, { wallet, autofill: true });
+  const res = await sub({ TransactionType: 'OfferCreate', Account: wallet.address, TakerGets: gets, TakerPays: pays }, { wallet, autofill: true });
   const code = res.result.meta.TransactionResult; if (code !== 'tesSUCCESS') throw new Error('limit order rejected: ' + code);
   let seq = (res.result.tx_json || {}).Sequence ?? res.result.Sequence;
   if (!seq) { await refreshOffers(true); const n = offC.find(o => !before.has(o.seq)); seq = n && n.seq; }
@@ -265,7 +274,7 @@ async function placeLimit(side, baseAmt, price) {
 }
 async function cancelOffer(seq) {
   if (!seq) return;
-  try { await client.submitAndWait({ TransactionType: 'OfferCancel', Account: wallet.address, OfferSequence: seq }, { wallet, autofill: true }); } catch (e) { log('cancel', seq, e.message); }
+  try { await sub({ TransactionType: 'OfferCancel', Account: wallet.address, OfferSequence: seq }, { wallet, autofill: true }); } catch (e) { log('cancel', seq, e.message); }
   offAt = 0; balAt = 0;
 }
 function makePos(side, base, quote, entry, stop, target, why) {
@@ -356,7 +365,7 @@ async function manageTp(px) {
 // ---------- strategy context / allocation ----------
 const mkCtx = () => S.ctxFrom(candles.closed, S.aggregate(candles.closed, candles.cur, cfg.htfMult || 4), { tradesToday: P.tradesToday || 0 });
 const useFrac = () => Math.min(1, Math.max(0.05, (P.use ?? 100) / 100));
-let runStartEq = null, prevB = null, walC = null, walAt = 0, walTxC = [], walTxAt = 0, balC = null, balAt = 0, offC = [], offAt = 0, xuC = null, xuAt = 0;
+let busySince = 0, runStartEq = null, prevB = null, walC = null, walAt = 0, walTxC = [], walTxAt = 0, balC = null, balAt = 0, offC = [], offAt = 0, xuC = null, xuAt = 0;
 const amtOf = x => (typeof x === 'string' ? { cur: 'XRP', v: Number(x) / 1e6, iss: null } : { cur: x.currency, v: Number(x.value), iss: x.issuer });
 const isAsset = (x, a) => (isXRP(a) ? x.cur === 'XRP' : x.cur === a.currency && x.iss === a.issuer);
 async function refreshOffers(force) {
@@ -378,7 +387,7 @@ async function xuNow(px) {
 let last = { px: null, sig: { trend: 'NONE', why: 'warming up' }, err: null };
 const equityOf = (b, px) => b.quote + b.base * px;
 async function tick() {
-  if (busy) return; busy = true;
+  if (busy) { if (Date.now() - busySince > 90000) { log('watchdog: tick was stuck for 90s, resetting'); busy = false; } else return; } busy = true; busySince = Date.now();
   try {
     const px = await price(); last.px = px; last.err = null; last.at = Date.now(); errRun = 0;
     const now = Date.now();
@@ -472,18 +481,18 @@ async function tick() {
   } catch (err) { last.err = err.message; log('tick error:', err.message); if (!MOCK && ++errRun >= 4) rotateServer(); }
   finally { busy = false; }
 }
-async function locked(fn) { while (busy) await sleep(60); busy = true; try { return await fn(); } finally { busy = false; } }
+async function locked(fn) { while (busy && Date.now() - busySince < 90000) await sleep(60); busy = true; busySince = Date.now(); try { return await fn(); } finally { busy = false; } }
 
 // ---------- API ----------
 const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    ver: 2.7, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 2.8, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
-    use: P.use ?? 100, goal: P.goal || 0, goalHit: !!P.goalHit, trades: state.trades.filter(t => !t.pair || t.pair === pair.id).slice(-300), marks: (P.marks || []).slice(-120), eq, start: startEq, logs, cfg: { ...S.DEFAULTS, ...cfg }, consec: P.consec, bal: balC, eqAll: last.eqAll ?? null, wal: walC ? { ...walC, at: walAt } : null, wtx: walTxC, noTrust: last.noTrust || null, eqNow: last.eq ?? null, note: last.note || null,
+    use: P.use ?? 100, goal: P.goal || 0, goalHit: !!P.goalHit, trades: state.trades.filter(t => !t.pair || t.pair === pair.id).slice(-300), marks: (P.marks || []).slice(-120), eq, start: startEq, logs, cfg: { ...S.DEFAULTS, ...cfg }, consec: P.consec, bal: balC, orphans: Math.max(0, offC.length - (P.pend ? 1 : 0) - (P.pos && P.pos.tp ? 1 : 0)), eqAll: last.eqAll ?? null, wal: walC ? { ...walC, at: walAt } : null, wtx: walTxC, noTrust: last.noTrust || null, eqNow: last.eq ?? null, note: last.note || null,
   };
 };
 const body = req => new Promise((res, rej) => { let d = ''; req.on('data', c => { d += c; if (d.length > 20000) { rej(new Error('too large')); req.destroy(); } }); req.on('end', () => { try { res(d ? JSON.parse(d) : {}); } catch (e) { rej(e); } }); });
@@ -534,7 +543,7 @@ const routes = {
     P.pos.userStop = true; save(); return {};
   }),
   'POST /api/shorton': async (b) => { state.shortOn = !!b.on; return {}; },
-  'POST /api/sell': async () => locked(async () => { if (P.pend) { await cancelOffer(P.pend.seq); P.pend = null; } if (!P.pos) throw new Error('No open position'); const px = await price(); if (!(await closePos(px, 'manual', cfg.stopSlippagePct))) throw new Error('Order not filled'); save(); return {}; }),
+  'POST /api/sell': async () => locked(async () => { if (P.pend) { await cancelOffer(P.pend.seq); P.pend = null; } if (!P.pos) throw new Error('No open position'); await closeAll('manual'); save(); return {}; }),
   'POST /api/auto': async (b) => { state.autoOn = !!b.on; return {}; },
   'POST /api/kill': async () => { state.halted = 'kill switch'; addLog('loss', 'Kill switch pressed'); return {}; },
   'POST /api/resume': async () => { state.halted = null; P.consec = 0; P.dayPnl = 0; startEq = null; addLog('info', 'Resumed'); return {}; },
@@ -556,7 +565,7 @@ const routes = {
     if (P.pos) P.pos.entryCandleT = candles.cur ? candles.cur.t : P.pos.entryCandleT;
     P.marks = []; save(); addLog('info', `timeframe ${m}m · rebuilt ${candles.closed.length} candles from ${P.ticks.length} live ticks`); return {};
   }),
-  'POST /api/flatten': async () => locked(async () => { if (P.pend) { await cancelOffer(P.pend.seq); P.pend = null; } if (!P.pos) return {}; const px = await price(); if (!(await closePos(px, 'flatten', cfg.stopSlippagePct))) throw new Error('Order not filled'); save(); return {}; }),
+  'POST /api/flatten': async () => locked(async () => { if (P.pend) { await cancelOffer(P.pend.seq); P.pend = null; } if (!P.pos) { pauseAuto(); return {}; } await closeAll('flatten'); save(); return {}; }),
   'POST /api/take': async (b) => locked(async () => { if (!P.pos) throw new Error('No open position'); const px = await price(); const f = Math.min(1, Math.max(0.05, +b.frac || 0.5)); if (!(await closePos(px, 'take profit', cfg.entrySlippagePct, f))) throw new Error('Order not filled'); save(); return {}; }),
   'POST /api/hedge': async () => { throw new Error('Hedge (long+short) is simulator-only for now'); },
   'POST /api/smart': async () => { throw new Error('Smart Auto is simulator-only for now'); },
@@ -569,17 +578,18 @@ const routes = {
     if (side === 'BUY' && amtB * pr > bal.quote + 1e-9) throw new Error(`Need ${(amtB * pr).toFixed(4)} ${sym(pair.quote.currency)}, spendable ${bal.quote.toFixed(4)}`);
     if (side === 'SELL' && amtB > bal.base + 1e-9) throw new Error(`Need ${amtB} ${sym(pair.base.currency)}, spendable ${bal.base.toFixed(4)}`);
     const gets = side === 'BUY' ? amount(pair.quote, amtB * pr) : amount(pair.base, amtB), pays = side === 'BUY' ? amount(pair.base, amtB) : amount(pair.quote, amtB * pr);
-    const res = await client.submitAndWait({ TransactionType: 'OfferCreate', Account: wallet.address, TakerGets: gets, TakerPays: pays }, { wallet, autofill: true });
+    const res = await sub({ TransactionType: 'OfferCreate', Account: wallet.address, TakerGets: gets, TakerPays: pays }, { wallet, autofill: true });
     const code = res.result.meta.TransactionResult; offAt = 0; balAt = 0;
     if (code !== 'tesSUCCESS') throw new Error('Order rejected: ' + code);
     addLog('info', `LIMIT ${side} ${amtB} ${sym(pair.base.currency)} @ ${pr} placed (rests on the book until filled or cancelled)`); return {};
   }),
-  'POST /api/cancel': async (b) => locked(async () => {
+  'POST /api/cancel': async (b) => {
     if (!wallet) throw new Error('No wallet'); const seq = Math.round(+b.seq); if (!(seq > 0)) throw new Error('bad order sequence');
-    if (!offC.some(o => o.seq === seq)) throw new Error('That order is not on this pair');
-    const res = await client.submitAndWait({ TransactionType: 'OfferCancel', Account: wallet.address, OfferSequence: seq }, { wallet, autofill: true });
-    offAt = 0; balAt = 0; const code = res.result.meta.TransactionResult; if (code !== 'tesSUCCESS') throw new Error('Cancel failed: ' + code); addLog('info', 'Order #' + seq + ' cancelled'); return {};
-  }),
+    const res = await sub({ TransactionType: 'OfferCancel', Account: wallet.address, OfferSequence: seq }, { wallet, autofill: true });
+    const code = res.result.meta.TransactionResult; if (code !== 'tesSUCCESS' && code !== 'tecNO_ENTRY') throw new Error('Cancel failed: ' + code);
+    if (P.pend && P.pend.seq === seq) P.pend = null; if (P.pos && P.pos.tp && P.pos.tp.seq === seq) P.pos.tp = null;
+    offAt = 0; balAt = 0; pauseAuto(); addLog('info', 'Order #' + seq + ' cancelled' + (code === 'tecNO_ENTRY' ? ' (it was already gone)' : '')); refreshOffers(true).catch(() => {}); return {};
+  },
   'POST /api/send': async (b) => locked(async () => {
     if (!wallet) throw new Error('No wallet connected'); if (MOCK) throw new Error('mock mode');
     if (b.confirm !== true) throw new Error('Not confirmed');
@@ -590,7 +600,7 @@ const routes = {
     else { const l = w.lines.find(x => x.raw === cur && x.issuer === b.issuer); if (!l) throw new Error('No such trust line on this wallet'); if (n > l.balance + 1e-9) throw new Error(`Only ${l.balance} ${sym(cur)} available`); Amount = { currency: cur, issuer: l.issuer, value: String(n) }; }
     const tx = { TransactionType: 'Payment', Account: wallet.address, Destination: to, Amount };
     if (b.tag !== undefined && b.tag !== null && String(b.tag).trim() !== '') { const t = Number(b.tag); if (!Number.isInteger(t) || t < 0 || t > 4294967295) throw new Error('Invalid destination tag'); tx.DestinationTag = t; }
-    const res = await client.submitAndWait(tx, { wallet, autofill: true }), code = res.result.meta.TransactionResult;
+    const res = await sub(tx, { wallet, autofill: true }), code = res.result.meta.TransactionResult;
     balAt = 0; walTxAt = 0; if (code !== 'tesSUCCESS') throw new Error('Payment failed: ' + code);
     addLog('info', `SENT ${n} ${cur === 'XRP' ? 'XRP' : sym(cur)} to ${to}${tx.DestinationTag !== undefined ? ' tag ' + tx.DestinationTag : ''} (${res.result.hash})`); return { hash: res.result.hash };
   }),
@@ -598,15 +608,15 @@ const routes = {
     if (!wallet) throw new Error('No wallet connected'); if (MOCK) throw new Error('mock mode');
     const symb = String(b.symbol || '').trim(), issuer = String(b.issuer || '').trim();
     if (!symb || !xrpl.isValidClassicAddress(issuer)) throw new Error('need a currency code and a valid issuer address');
-    const res = await client.submitAndWait({ TransactionType: 'TrustSet', Account: wallet.address, LimitAmount: { currency: hex(symb), issuer, value: String(b.limit || '1000000000') } }, { wallet, autofill: true }), code = res.result.meta.TransactionResult;
+    const res = await sub({ TransactionType: 'TrustSet', Account: wallet.address, LimitAmount: { currency: hex(symb), issuer, value: String(b.limit || '1000000000') } }, { wallet, autofill: true }), code = res.result.meta.TransactionResult;
     balAt = 0; if (code !== 'tesSUCCESS') throw new Error('Trust line failed: ' + code);
     addLog('info', `Trust line set for ${symb} (${issuer}): you can now receive it (holds 0.2 XRP reserve)`); return {};
   }),
-  'POST /api/cancelall': async () => locked(async () => {
-    if (!wallet) throw new Error('No wallet'); let n = 0;
-    for (const o of [...offC]) { await client.submitAndWait({ TransactionType: 'OfferCancel', Account: wallet.address, OfferSequence: o.seq }, { wallet, autofill: true }); n++; }
-    offAt = 0; balAt = 0; addLog('info', `Cancelled ${n} open order(s) on ${pair.id}`); return { n };
-  }),
+  'POST /api/cancelall': async () => {
+    if (!wallet) throw new Error('No wallet'); await refreshOffers(true); let n = 0, fails = 0;
+    for (const o of [...offC]) { try { const res = await sub({ TransactionType: 'OfferCancel', Account: wallet.address, OfferSequence: o.seq }, { wallet, autofill: true }); const c = res.result.meta.TransactionResult; if (c === 'tesSUCCESS' || c === 'tecNO_ENTRY') n++; else fails++; } catch (e) { fails++; addLog('info', 'cancel #' + o.seq + ' failed: ' + e.message); } }
+    P.pend = null; if (P.pos) P.pos.tp = null; offAt = 0; balAt = 0; pauseAuto(); addLog('info', `Cancelled ${n} open order(s) on ${pair.id}${fails ? ', ' + fails + ' failed' : ''}`); await refreshOffers(true).catch(() => {}); if (fails && !n) throw new Error('Could not cancel: see the log'); return { n, fails };
+  },
   'POST /api/alloc': async (b) => { if (b.use != null) P.use = Math.min(100, Math.max(5, +b.use || 100)); if (b.goal != null) P.goal = Math.min(50, Math.max(0, +b.goal || 0)); save(); return { use: P.use ?? 100, goal: P.goal || 0 }; },
 };
 
