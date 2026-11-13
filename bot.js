@@ -50,6 +50,9 @@ function saveHist(force) {
     fs.writeFileSync(F('history.json') + '.tmp', JSON.stringify(hist)); fs.renameSync(F('history.json') + '.tmp', F('history.json'));
   } catch (e) { log('history save failed:', e.message); }
 }
+const { Brain } = require('./brain');
+const brain = new Brain(); state.brain ||= {}; brain.acfg = state.brain.acfg || {}; brain.lastTune = state.brain.lastTune || null; brain.hits = state.brain.hits || {};
+brain.rebuild(hist.trades.filter(t => true));
 state.pairId ||= 'XRP/RLUSD'; state.autoOn ??= true; state.shortOn ??= !!cfg.autoShort; state.pairs ||= {}; state.trades ||= [];
 let pair = pairById(state.pairId) || pairs[0];
 let P, candles; // per-pair runtime
@@ -84,6 +87,7 @@ async function backfill() {
 function save() {
   if (P.ticks.length > 8000) P.ticks.splice(0, P.ticks.length - 6000);
   P.closed = candles.closed; P.cur = candles.cur; state.pairId = pair.id;
+  state.brain = { acfg: brain.acfg, lastTune: brain.lastTune, hits: brain.hits };
   fs.writeFileSync(F('state.json') + '.tmp', JSON.stringify(state));
   fs.renameSync(F('state.json') + '.tmp', F('state.json'));
 }
@@ -120,7 +124,9 @@ async function bookBest(p) {
     client.request({ command: 'book_offers', taker_gets: asset(p.quote), taker_pays: asset(p.base), limit: 20 }),
   ]);
   const a = asks.result.offers, b = bids.result.offers;
-  return { ask: walk(a, true, ref), bid: walk(b, false, ref), nA: a.length, nB: b.length };
+  const depth = (offers, getsIsBase) => { if (!offers.length) return 0; const f = o => { const G = amt(o.taker_gets_funded || o.TakerGets), Pz = amt(o.taker_pays_funded || o.TakerPays); return { G: G.v, Pz: Pz.v, px: getsIsBase ? Pz.v / G.v : G.v / Pz.v }; }, best = f(offers[0]).px; let q = 0;
+    for (const o of offers) { const x = f(o); if (!(x.G > 0 && x.Pz > 0)) continue; if (getsIsBase ? x.px <= best * 1.005 : x.px >= best * 0.995) q += getsIsBase ? x.Pz : x.G; } return q; };
+  return { ask: walk(a, true, ref), bid: walk(b, false, ref), nA: a.length, nB: b.length, depthAsk: depth(a, true), depthBid: depth(b, false) };
 }
 // Real DEX trades: book_changes returns per-ledger OHLC for every book (AMM + order book fills). Used to catch wicks between polls.
 // Field formats vary by server, so every candidate scaling is checked against the executable mid and only accepted within 5%.
@@ -151,7 +157,7 @@ async function price() {
   if (A && B && B.ask && B.bid) { const m = (B.ask + B.bid) / 2; if (Math.abs(A.spot - m) / A.spot > 0.05) throw new Error(`AMM ${A.spot} and book ${m} disagree >5%, skipping tick`); }
   let v = ask && bid && bid < ask ? (ask + bid) / 2 : (A ? A.spot : (ask || bid));
   if (!v || !isFinite(v)) throw new Error('no price for ' + pair.id);
-  last.ask = ask; last.bid = bid; last.src = { amm: A ? A.spot : null, bookAsk: B ? B.ask : null, bookBid: B ? B.bid : null, nA: B ? B.nA : 0, nB: B ? B.nB : 0 };
+  last.ask = ask; last.bid = bid; last.src = { amm: A ? A.spot : null, bookAsk: B ? B.ask : null, bookBid: B ? B.bid : null, nA: B ? B.nA : 0, nB: B ? B.nB : 0, depthAsk: B ? B.depthAsk : 0, depthBid: B ? B.depthBid : 0 }; last.priceAt = Date.now();
   return v;
 }
 async function walletData() {
@@ -213,13 +219,15 @@ async function swap(side, amountIn, px, slipPct) {
   const dB = after.base - before.base + (isXRP(pair.base) ? fee : 0);
   const dQ = after.quote - before.quote + (isXRP(pair.quote) ? fee : 0);
   if (code !== 'tesSUCCESS' || Math.abs(dQ) < 1e-9) return { filled: false, code };
-  return { filled: true, code, base: Math.abs(dB), quote: Math.abs(dQ), price: Math.abs(dQ) / Math.abs(dB) };
+  const fp = Math.abs(dQ) / Math.abs(dB); brain.recordSlip((side === 'BUY' ? fp / px - 1 : 1 - fp / px) * 100);
+  return { filled: true, code, base: Math.abs(dB), quote: Math.abs(dQ), price: fp };
 }
 
 async function openPos(px, stop, target, spendQuote, why) {
-  const r = await swap('BUY', spendQuote, px, cfg.entrySlippagePct);
+  const r = await swap('BUY', spendQuote, px, cfg.smart !== false ? brain.slipPct(cfg) : cfg.entrySlippagePct);
   if (!r.filled) { addLog('info', `BUY not filled (${r.code})`); return false; }
-  P.pos = { side: 'LONG', base: r.base, cost: r.quote, entry: r.price, stop, target, userStop: false, entryCandleT: candles.cur.t, risk: Math.abs(r.price - stop) * r.base, t0: Date.now(), stop0: stop, base0: r.base, done: [] };
+  P.pos = { side: 'LONG', base: r.base, cost: r.quote, entry: r.price, stop, target, userStop: false, entryCandleT: candles.cur.t, risk: Math.abs(r.price - stop) * r.base, t0: Date.now(), stop0: stop, base0: r.base, done: [], ov: P.nextOv || null, reg: P.nextReg || null };
+  P.nextOv = P.nextReg = null;
   P.tradesToday = (P.tradesToday || 0) + 1;
   (P.marks ||= []).push({ t: candles.cur.t, price: r.price, kind: 'buy' }); if (P.marks.length > 200) P.marks.shift();
   logTrade([new Date().toISOString(), pair.id, 'BUY', wallet ? 'live' : 'paper', why, r.base.toFixed(6), r.quote.toFixed(6), r.price.toPrecision(8), '']);
@@ -227,9 +235,10 @@ async function openPos(px, stop, target, spendQuote, why) {
   return true;
 }
 async function openShort(px, stop, target, qtyBase, why) {
-  const r = await swap('SELL', qtyBase, px, cfg.entrySlippagePct);
+  const r = await swap('SELL', qtyBase, px, cfg.smart !== false ? brain.slipPct(cfg) : cfg.entrySlippagePct);
   if (!r.filled) { addLog('info', `SHORT not filled (${r.code})`); return false; }
-  P.pos = { side: 'SHORT', base: r.base, cost: r.quote, entry: r.price, stop, target, userStop: false, entryCandleT: candles.cur.t, risk: Math.abs(stop - r.price) * r.base, t0: Date.now(), stop0: stop, base0: r.base, done: [] };
+  P.pos = { side: 'SHORT', base: r.base, cost: r.quote, entry: r.price, stop, target, userStop: false, entryCandleT: candles.cur.t, risk: Math.abs(stop - r.price) * r.base, t0: Date.now(), stop0: stop, base0: r.base, done: [], ov: P.nextOv || null, reg: P.nextReg || null };
+  P.nextOv = P.nextReg = null;
   P.tradesToday = (P.tradesToday || 0) + 1;
   (P.marks ||= []).push({ t: candles.cur.t, price: r.price, kind: 'short' }); if (P.marks.length > 200) P.marks.shift();
   logTrade([new Date().toISOString(), pair.id, 'SHORT', wallet ? 'live' : 'paper', why, r.base.toFixed(6), r.quote.toFixed(6), r.price.toPrecision(8), '']);
@@ -268,8 +277,8 @@ function recordExit(rBase, rQuote, rPrice, reason) {
   P.dayPnl = (P.dayPnl || 0) + pnl;
   if (pnl < 0 && /stop/.test(reason)) P.lastStop = { t: Date.now(), long: !short };
   pos.cost -= pos.cost * portion; pos.base -= rBase;
-  state.trades.push({ t: Date.now(), pair: pair.id, side: short ? 'SHORT' : 'LONG', entry: pos.entry, exit: rPrice, pnl: +pnl.toFixed(6), r: pos.risk ? +(pnl / (pos.risk * portion)).toFixed(3) : null, reason, bars: pos.t0 ? Math.max(0, Math.round((Date.now() - pos.t0) / candles.tf)) : 0 }); if (state.trades.length > 500) state.trades.shift();
-  hist.trades.push(state.trades[state.trades.length - 1]); saveHist(true);
+  state.trades.push({ t: Date.now(), pair: pair.id, side: short ? 'SHORT' : 'LONG', entry: pos.entry, exit: rPrice, pnl: +pnl.toFixed(6), r: pos.risk ? +(pnl / (pos.risk * portion)).toFixed(3) : null, reg: pos.reg || null, reason, bars: pos.t0 ? Math.max(0, Math.round((Date.now() - pos.t0) / candles.tf)) : 0 }); if (state.trades.length > 500) state.trades.shift();
+  hist.trades.push(state.trades[state.trades.length - 1]); brain.learn(state.trades[state.trades.length - 1]); saveHist(true);
   (P.marks ||= []).push({ t: candles.cur.t, price: rPrice, kind: short ? 'cover' : 'sell' });
   logTrade([new Date().toISOString(), pair.id, short ? 'COVER' : 'SELL', wallet ? 'live' : 'paper', reason, rBase.toFixed(6), rQuote.toFixed(6), rPrice.toPrecision(8), pnl.toFixed(6)]);
   addLog(pnl < 0 ? 'loss' : 'sell', `${short ? 'COVER' : 'SELL'} ${rBase.toFixed(2)} @ ${rPrice.toPrecision(6)} · ${reason} · ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} ${sym(pair.quote.currency)}`);
@@ -294,7 +303,8 @@ async function cancelOffer(seq) {
 }
 function makePos(side, base, quote, entry, stop, target, why) {
   const sh = side === 'SHORT';
-  P.pos = { side, base, cost: quote, entry, stop, target, userStop: false, entryCandleT: candles.cur.t, risk: Math.abs(entry - stop) * base, t0: Date.now(), stop0: stop, base0: base, done: [] };
+  P.pos = { side, base, cost: quote, entry, stop, target, userStop: false, entryCandleT: candles.cur.t, risk: Math.abs(entry - stop) * base, t0: Date.now(), stop0: stop, base0: base, done: [], ov: P.nextOv || null, reg: P.nextReg || null };
+  P.nextOv = P.nextReg = null;
   P.tradesToday = (P.tradesToday || 0) + 1;
   (P.marks ||= []).push({ t: candles.cur.t, price: entry, kind: sh ? 'short' : 'buy' }); if (P.marks.length > 200) P.marks.shift();
   logTrade([new Date().toISOString(), pair.id, sh ? 'SHORT' : 'BUY', wallet ? 'live' : 'paper', why, base.toFixed(6), quote.toFixed(6), entry.toPrecision(8), '']);
@@ -310,7 +320,7 @@ function autoLv(sg, px, long) {
 // f: 0 = best bid (patient maker), 1 = best ask (marketable). The bot starts patient and walks the price toward the other side until filled.
 function limitPx(long, px, f) { const bid = last.bid, ask = last.ask; return bid && ask && bid < ask ? (long ? bid + f * (ask - bid) : ask - f * (ask - bid)) : (long ? px * (1 - 0.0004 + 0.0006 * f) : px * (1 + 0.0004 - 0.0006 * f)); }
 async function openLimit(long, px, stop, target, amt, why) {
-  const f0 = Math.min(1, Math.max(0, cfg.limitSpreadFrac ?? 0.3));
+  const f0 = Math.min(1, Math.max(0, cfg.smart !== false ? brain.limitFrac(cfg) : (cfg.limitSpreadFrac ?? 0.3)));
   const lp = limitPx(long, px, f0);
   const baseAmt = long ? amt / lp : amt;
   if (baseAmt * lp < cfg.minTradeQuote) return false;
@@ -320,7 +330,17 @@ async function openLimit(long, px, stop, target, amt, why) {
   addLog('info', `LIMIT ${long ? 'BUY' : 'SELL-SHORT'} ${baseAmt.toFixed(4)} ${sym(pair.base.currency)} @ ${lp.toPrecision(6)} resting on the book (timeout ${cfg.limitTimeoutSec}s)`);
   return true;
 }
+function brainSnap() { const src = last.src || {}; return { ask: last.ask, bid: last.bid, amm: src.amm, bookBid: src.bookBid, bookAsk: src.bookAsk, depthAsk: src.depthAsk, depthBid: src.depthBid, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, tickAgeMs: last.priceAt ? Date.now() - last.priceAt : 0, ledgerAgeMs: last.ledgerAt ? Date.now() - last.ledgerAt : 0 }; }
+const ecfg = () => (cfg.smart !== false ? { ...cfg, ...brain.acfg } : cfg);
+let lastVeto = '', lastVetoAt = 0;
 async function enter(long, px, stop, target, amt, why) {
+  if (cfg.smart !== false) {
+    const d = brain.evaluate({ long, px, stop, closed: candles.closed, cfg, snap: brainSnap(), sess: { consec: P.consec || 0, ddPct: last.ddPct || 0 }, relaxed: /^always-in/.test(why), orderQuote: long ? amt : amt * px });
+    if (!d.ok) { if (d.why !== lastVeto || Date.now() - lastVetoAt > 60000) { lastVeto = d.why; lastVetoAt = Date.now(); addLog('info', `SMART skipped ${long ? 'long' : 'short'}: ${d.why}`); } return false; }
+    const avail = balC ? (long ? balC.quote : balC.base) : Infinity; amt = Math.min(amt * d.size, avail * 0.98);
+    if ((long ? amt : amt * px) < cfg.minTradeQuote) return false;
+    P.nextOv = d.ov; P.nextReg = d.reg; why = why + ` [smart ${d.reg} ${Math.round(d.score)} x${d.size.toFixed(2)}]`;
+  } else { P.nextOv = null; P.nextReg = null; }
   if (cfg.entryMode === 'limit' && wallet && !MOCK && client) { try { return await openLimit(long, px, stop, target, amt, why); } catch (e) { addLog('info', 'limit entry failed (' + e.message + '), using market order'); } }
   return long ? openPos(px, stop, target, amt, why) : openShort(px, stop, target, amt, why);
 }
@@ -338,7 +358,7 @@ async function handlePend(px, halt) {
   const age = (Date.now() - o.t0) / 1000, ch = cfg.limitChasePct / 100;
   const away = o.long ? px > (o.sigPx || o.price) * (1 + ch) : px < (o.sigPx || o.price) * (1 - ch), dead = o.long ? px <= o.stop : px >= o.stop, timeout = age > cfg.limitTimeoutSec;
   let why = null;
-  if (live && (halt || dead || away || timeout)) { await cancelOffer(o.seq); live = null; why = halt ? 'halt' : dead ? 'stop level hit first' : away ? 'price ran away' : 'timeout'; }
+  if (live && (halt || dead || away || timeout)) { await cancelOffer(o.seq); live = null; why = halt ? 'halt' : dead ? 'stop level hit first' : away ? 'price ran away' : 'timeout'; if (away || timeout) brain.recordFill(false); }
   if (live) { // untouched resting order: walk it toward the market
     if (!dead && live.base >= o.base * 0.999 && Date.now() - o.lastRe >= (cfg.limitRepriceSec || 4) * 1000) {
       const f = Math.min(1.1, o.f0 + (1.1 - o.f0) * Math.min(1, age / (cfg.limitTimeoutSec * 0.7))), np = limitPx(o.long, px, f);
@@ -355,6 +375,7 @@ async function handlePend(px, halt) {
   P.pend = null;
   if (dBase >= o.base * 0.05 && dBase * px >= cfg.minTradeQuote * 0.1) {
     const entry = dBase > 0 ? dQuote / dBase : o.price, A = autoLv({ stop: o.stop, target: o.target, stopPct: 0 }, entry, o.long); // re-anchor % stop/target to the real fill
+    brain.recordFill(true);
     makePos(o.long ? 'LONG' : 'SHORT', dBase, dQuote, entry, A.stop, A.target, o.why + ' (limit)');
     await placeTp(P.pos);
   } else {
@@ -441,12 +462,14 @@ async function tick() {
     if (P.goal > 0 && !P.goalHit && startEq && tradePnlPct >= P.goal) { P.goalHit = true; state.halted = `daily goal +${P.goal}% reached`; addLog('buy', 'DAILY GOAL reached: flattening, resumes tomorrow'); }
     if (state.halted && /^daily loss/.test(state.halted) && -tradePnlPct < cfg.dailyLossHaltPct) { addLog('info', `Daily-loss halt cleared: loss is now ${(-tradePnlPct).toFixed(2)}% (under ${cfg.dailyLossHaltPct}%)`); state.halted = null; }
     if (cfg.hardFloorPct > 0 && runStartEq > 0 && !state.halted && e < runStartEq * (1 - cfg.hardFloorPct / 100)) { state.halted = `hard floor: equity down ${cfg.hardFloorPct}% from the run start`; addLog('loss', 'HALT ' + state.halted + ' (press Resume to continue)'); }
+    last.ddPct = Math.max(0, -tradePnlPct);
+    { const n = candles.closed.length; if (cfg.smart !== false && n >= 220 && n % 150 === 0 && n !== P.retuneN) { P.retuneN = n; brain.retune(candles.closed, cfg, (a, t) => addLog('info', 'SMART re-tuned · ' + t)); } }
     const halt = fs.existsSync(F('STOP')) ? 'STOP file present' : state.halted;
     if (P.pos && !(P.pos.base > 1e-9)) { addLog('info', 'cleared empty position record'); P.pos = null; }
     if (P.pend) await handlePend(px, halt);
     if (P.pos && P.pos.tp) await manageTp(px);
     if (P.pos) {
-      const m = (P.pos.side === 'SHORT' ? S.manageShort : S.manage)(P.pos, px, candles.closed, cfg, ctx);
+      const m = (P.pos.side === 'SHORT' ? S.manageShort : S.manage)(P.pos, px, candles.closed, P.pos.ov ? { ...ecfg(), ...P.pos.ov } : ecfg(), ctx);
       P.pos.stop = m.stop;
       if (m.exit && m.reason === 'take-profit' && P.pos.tp) { /* resting limit handles it */ }
       else if (m.partial && !m.exit && !halt) { const q = P.pos.base0 * m.partial; if (await closePos(px, `ladder ${m.level + 1}`, cfg.entrySlippagePct, Math.min(1, q / P.pos.base))) { if (P.pos) P.pos.done.push(m.level); } }
@@ -476,7 +499,7 @@ async function tick() {
           const cl = candles.closed, c2 = cl[cl.length - 1];
           // side vote: candle-structure trend, EMA 9/21, last-candle slope, recent tick momentum, and a penalty on the side that just stopped out
           const ema = (arr, n) => { const k = 2 / (n + 1); let v = arr[0]; for (const x of arr) v = x * k + v * (1 - k); return v; }, cs = cl.slice(-40).map(c => c.close);
-          let score = (sig.trend === 'UP' ? 1 : sig.trend === 'DOWN' ? -1 : 0) + (cs.length >= 21 ? (ema(cs, 9) > ema(cs, 21) ? 1 : -1) : 0) + (cl.length >= 2 ? (c2.close >= cl[cl.length - 2].close ? 0.5 : -0.5) : 0);
+          let score = (cfg.smart !== false ? brain.regimeVote(cl, px, cfg) : 0) + (sig.trend === 'UP' ? 1 : sig.trend === 'DOWN' ? -1 : 0) + (cs.length >= 21 ? (ema(cs, 9) > ema(cs, 21) ? 1 : -1) : 0) + (cl.length >= 2 ? (c2.close >= cl[cl.length - 2].close ? 0.5 : -0.5) : 0);
           const tk = P.ticks.slice(-40).map(t => t[1]); if (tk.length >= 10) score += px >= tk.reduce((a, b) => a + b, 0) / tk.length ? 0.5 : -0.5;
           if (P.lastStop && Date.now() - P.lastStop.t < cfg.timeframeMinutes * 60000 * 3) score += P.lastStop.long ? -1.5 : 1.5;
           const up = score > 0 ? true : score < 0 ? false : px >= c2.close;
@@ -506,11 +529,11 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    ver: 2.9, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 3.0, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
-    use: P.use ?? 100, goal: P.goal || 0, goalHit: !!P.goalHit, trades: state.trades.filter(t => !t.pair || t.pair === pair.id).slice(-5000), base0: (hist.base[pair.id] || {}).eq ?? null, histSince: hist.since, histEq: hist.eq.filter(p => p[2] === pair.id).slice(-3000).map(p => [p[0], p[1]]), nTradesAll: state.trades.length, marks: (P.marks || []).slice(-120), eq, start: startEq, logs, cfg: { ...S.DEFAULTS, ...cfg }, consec: P.consec, bal: balC, orphans: Math.max(0, offC.length - (P.pend ? 1 : 0) - (P.pos && P.pos.tp ? 1 : 0)), eqAll: last.eqAll ?? null, wal: walC ? { ...walC, at: walAt } : null, wtx: walTxC, noTrust: last.noTrust || null, eqNow: last.eq ?? null, note: last.note || null,
+    use: P.use ?? 100, goal: P.goal || 0, goalHit: !!P.goalHit, trades: hist.trades.filter(t => !t.pair || t.pair === pair.id).slice(-5000), base0: (hist.base[pair.id] || {}).eq ?? null, histSince: hist.since, histEq: hist.eq.filter(p => p[2] === pair.id).slice(-3000).map(p => [p[0], p[1]]), nTradesAll: state.trades.length, marks: (P.marks || []).slice(-120), eq, start: startEq, logs, cfg: { ...S.DEFAULTS, ...cfg }, consec: P.consec, bal: balC, smart: cfg.smart !== false, brain: brain.view(cfg, P.consec), orphans: Math.max(0, offC.length - (P.pend ? 1 : 0) - (P.pos && P.pos.tp ? 1 : 0)), eqAll: last.eqAll ?? null, wal: walC ? { ...walC, at: walAt } : null, wtx: walTxC, noTrust: last.noTrust || null, eqNow: last.eq ?? null, note: last.note || null,
   };
 };
 const body = req => new Promise((res, rej) => { let d = ''; req.on('data', c => { d += c; if (d.length > 20000) { rej(new Error('too large')); req.destroy(); } }); req.on('end', () => { try { res(d ? JSON.parse(d) : {}); } catch (e) { rej(e); } }); });
@@ -586,7 +609,8 @@ const routes = {
   'POST /api/flatten': async () => locked(async () => { if (P.pend) { await cancelOffer(P.pend.seq); P.pend = null; } if (!P.pos) { pauseAuto(); return {}; } await closeAll('flatten'); save(); return {}; }),
   'POST /api/take': async (b) => locked(async () => { if (!P.pos) throw new Error('No open position'); const px = await price(); const f = Math.min(1, Math.max(0.05, +b.frac || 0.5)); if (!(await closePos(px, 'take profit', cfg.entrySlippagePct, f))) throw new Error('Order not filled'); save(); return {}; }),
   'POST /api/hedge': async () => { throw new Error('Hedge (long+short) is simulator-only for now'); },
-  'POST /api/smart': async () => { throw new Error('Smart Auto is simulator-only for now'); },
+  'POST /api/smart': async (b) => { cfg.smart = !!b.on; addLog('info', 'Smart brain ' + (cfg.smart ? 'ON' : 'OFF')); return {}; },
+  'POST /api/smartfeat': async (b) => { const id = String(b.id || ''); if (!require('./brain').FEATURES.some(f => f.id === id)) throw new Error('unknown feature'); const off = new Set(cfg.smartOff || []); if (b.on) off.delete(id); else off.add(id); cfg.smartOff = [...off]; return {}; },
   'POST /api/limit': async (b) => locked(async () => {
     if (!wallet) throw new Error('Connect a wallet to place real orders'); if (MOCK) throw new Error('mock mode');
     const side = b.side === 'sell' ? 'SELL' : 'BUY', pr = num(b.price, 'price'), amtB = num(b.amount, 'amount'), px = last.px;

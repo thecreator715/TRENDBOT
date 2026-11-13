@@ -36,5 +36,7 @@
   "limitRepriceSec": 4,
   "runForever": true,
   "hardFloorPct": 50,
-  "manualPauseCandles": 3
+  "manualPauseCandles": 3,
+  "smart": true,
+  "smartOff": []
 }

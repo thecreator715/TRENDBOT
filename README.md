@@ -24,3 +24,6 @@ With a wallet connected the bot trades **real funds** on mainnet. The seed is ke
 
 ## Your analytics are permanent
 Trades and the equity history are saved in history.json (with history.bak.json as a rolling backup) next to bot.js. Restarts, Resume and deleting state.json do not erase them. When updating, copy the new files over the old folder and keep history.json. Do not delete it unless you want to start the analytics from zero.
+
+## Smart Auto brain (v3.0, ON by default)
+25 safeguards (regime score gate, counter-trend veto, cost/liquidity/divergence/stale-data guards, learned sizing, adaptive exits, auto re-tune and more) run on every automatic entry. Each can be switched off in the Smart tab. Manual Buy/Short bypass it. It reduces bad entries; it cannot guarantee profit.
