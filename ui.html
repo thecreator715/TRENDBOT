@@ -290,6 +290,7 @@ body.chartonly .colB,body.chartonly .colC{display:none!important}body.chartonly 
 
 <!-- ================= ANALYTICS ================= -->
 <div id="pgAnalytics" class="hide">
+  <div class="note" id="histNote" style="display:flex;gap:10px;align-items:center;justify-content:space-between"><span id="histTxt"></span><button class="sm" id="bDlHist">Download history</button></div>
   <div class="akp" id="akp"></div>
   <div class="an">
     <div class="card"><h2><span>Equity &amp; underwater drawdown</span></h2><div class="cvs tall"><canvas id="cEq"></canvas></div></div>
@@ -765,8 +766,9 @@ async function act(name,p={}){try{
   SIM[name](p);render();return{}}catch(e){toast(e.message);return null}}
 let _vw=0;
 async function poll(){try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)return;S=await r.json();Object.assign(cfg,S.cfg||{});
-  if(MODE==='live'){if(S.pairs&&$('pairSel').options.length!==S.pairs.length+1)fillPairs(S.pairs);const f=$('foot');if(f){if(!S.ver||S.ver<2.8)f.innerHTML='<b style="color:#ff8a9a">An OLD TRENDBOT is running (v'+(S.ver||'?')+', need 2.8). Close it: run STOP-TRENDBOT.command or Terminal: pkill -f "node bot.js" , then double-click START-TRENDBOT.command from the NEW unzipped folder.</b>';else if(S.note)f.innerHTML='<b style="color:#ffb84d">'+S.note+'</b>';else if(S.err)f.innerHTML='<b style="color:#ffb84d">Price feed error: '+S.err+'</b> · retrying';else f.textContent='Live · bot v'+S.ver+(S.bid&&S.ask?' · bid '+fp(S.bid)+' / ask '+fp(S.ask):'')+' · '+S.nTicks+' price ticks stored · DEX trades '+(S.dexN||0)+(S.dexErr?' (book_changes: '+String(S.dexErr).slice(0,40)+')':'')+(S.ledger?' · ledger #'+S.ledger:'')+(S.src?' · AMM '+(S.src.amm?fp(S.src.amm):'—')+' / book '+(S.src.bookBid?fp(S.src.bookBid):'—')+'–'+(S.src.bookAsk?fp(S.src.bookAsk):'—'):'')+(S.ref?' · Bitstamp XRP/USD '+fp(S.ref)+(S.refDev!=null?' ('+(S.refDev>=0?'+':'')+S.refDev.toFixed(2)+'%'+(Math.abs(S.refDev)>3?' ⚠ CHECK FEED':'')+')':''):'')+' · last tick '+(S.tickAt?Math.round((Date.now()-S.tickAt)/1000)+'s ago':'—')+' · stops are polled, not on-ledger.'}}
+  if(MODE==='live'){if(S.pairs&&$('pairSel').options.length!==S.pairs.length+1)fillPairs(S.pairs);const f=$('foot');if(f){if(!S.ver||S.ver<2.9)f.innerHTML='<b style="color:#ff8a9a">An OLD TRENDBOT is running (v'+(S.ver||'?')+', need 2.9). Close it: run STOP-TRENDBOT.command or Terminal: pkill -f "node bot.js" , then double-click START-TRENDBOT.command from the NEW unzipped folder.</b>';else if(S.note)f.innerHTML='<b style="color:#ffb84d">'+S.note+'</b>';else if(S.err)f.innerHTML='<b style="color:#ffb84d">Price feed error: '+S.err+'</b> · retrying';else f.textContent='Live · bot v'+S.ver+(S.bid&&S.ask?' · bid '+fp(S.bid)+' / ask '+fp(S.ask):'')+' · '+S.nTicks+' price ticks stored · DEX trades '+(S.dexN||0)+(S.dexErr?' (book_changes: '+String(S.dexErr).slice(0,40)+')':'')+(S.ledger?' · ledger #'+S.ledger:'')+(S.src?' · AMM '+(S.src.amm?fp(S.src.amm):'—')+' / book '+(S.src.bookBid?fp(S.src.bookBid):'—')+'–'+(S.src.bookAsk?fp(S.src.bookAsk):'—'):'')+(S.ref?' · Bitstamp XRP/USD '+fp(S.ref)+(S.refDev!=null?' ('+(S.refDev>=0?'+':'')+S.refDev.toFixed(2)+'%'+(Math.abs(S.refDev)>3?' ⚠ CHECK FEED':'')+')':''):'')+' · last tick '+(S.tickAt?Math.round((Date.now()-S.tickAt)/1000)+'s ago':'—')+' · stops are polled, not on-ledger.'}}
   if(MODE==='live'&&S.wal&&S.live)paintWallet({...S.wal,tx:S.wtx||[]});
+  try{mergeLocal()}catch{}{const h=$('histTxt');if(h&&MODE==='live')h.textContent='Analytics are saved permanently on this computer (history.json + a copy in this browser): '+(S.nTradesAll||0)+' trades since '+(S.histSince?new Date(S.histSince).toLocaleDateString():'—')+'. Restarts, Resume and deleting state.json never erase them.'}
   {const nb=$('bNever');if(nb&&MODE==='live'){nb.textContent='Never halt: '+(cfg.runForever?'ON':'OFF');nb.classList.toggle('on',!!cfg.runForever)}else if(nb)nb.style.display='none'}
   render()}catch{}}
 
@@ -895,6 +897,10 @@ cv.addEventListener('pointerup',async e=>{PANST=null;if(!DRAG)return;const d=DRA
   else render()});
 
 // ================= analytics =================
+function mergeLocal(){if(MODE!=='live'||!S||!S.pair)return;let st={};try{st=JSON.parse(localStorage.getItem('tb_hist_v1')||'{}')}catch{}
+  const key=t=>t.t+'|'+t.side+'|'+t.entry,m=new Map((st[S.pair]||[]).map(t=>[key(t),t]));(S.trades||[]).forEach(t=>{if(t&&typeof t==='object')m.set(key(t),t)});
+  const out=[...m.values()].sort((a,b)=>a.t-b.t).slice(-20000);st[S.pair]=out;try{localStorage.setItem('tb_hist_v1',JSON.stringify(st))}catch{}S.trades=out}
+function dlHist(){const rows=(S.trades||[]);const blob=new Blob([JSON.stringify({pair:S.pair,since:S.histSince,trades:rows,equity:S.histEq||[]},null,1)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='trendbot-history-'+(S.pair||'').replace('/','-')+'.json';a.click()}
 const NT=()=>(S.trades||[]).map(t=>typeof t==='number'?{pnl:t,side:'LONG',r:null,reason:'',bars:0}:t);
 function metrics(T,base){
   const n=T.length,w=T.filter(t=>t.pnl>0),l=T.filter(t=>t.pnl<=0),gp=w.reduce((a,t)=>a+t.pnl,0),gl=-l.reduce((a,t)=>a+t.pnl,0),net=gp-gl;
@@ -1099,7 +1105,7 @@ function render(){
   if(T.length>=15&&lwr!=null&&lwr<m.wr-20){eb.textContent='EDGE DECAY';eb.className='badge b-am'}else{eb.textContent=T.length<5?'EDGE ?':'EDGE OK';eb.className='badge '+(T.length<5?'b-no':'b-up')}
   // kpis
   const k=(l,v,s,c)=>`<div class="kpi"><div class="l">${l}</div><div class="v ${c||''}">${v}</div><div class="s">${s||''}</div></div>`;
-  const tot=eq-(S.base0||start);const eqD=(MODE==='live'&&S.eqAll!=null)?S.eqAll:eq;$('kpiStrip').innerHTML=k('Equity',f2(eqD,2),q+(fx()?' · '+xrpf(eqD*fx().xrp)+' · '+usd(eqD*fx().usd):'')+(MODE==='live'&&S.eqAll!=null?' · tradable '+f2(eq,2):''))+k('Total P/L',sg(tot,2),sg(tot/(S.base0||start||1)*100)+'%',tot>=0?'pos':'neg')+(fx()?k('P/L $',usd(tot*fx().usd),xrpf(tot*fx().xrp),tot>=0?'pos':'neg'):'')+k('Open P/L',sg(op,op&&Math.abs(op)<1?3:2),p?(sh?'short':'long'):'flat',op>=0?'pos':'neg')+k('Win rate',m.n?f2(m.wr,0)+'%':'—',m.n+' trades')+k('Regime',E?E.name:'—',E?Math.round(E.conf)+'% conf':'')+k('Volatility',E?f2(E.atrPct,2)+'%':'—',E?'ATR · '+f2(E.vr,2)+'× norm':'');
+  const tot=(MODE==='live'&&S.base0!=null&&S.eqAll!=null)?S.eqAll-S.base0:eq-(S.base0||start);const eqD=(MODE==='live'&&S.eqAll!=null)?S.eqAll:eq;$('kpiStrip').innerHTML=k('Equity',f2(eqD,2),q+(fx()?' · '+xrpf(eqD*fx().xrp)+' · '+usd(eqD*fx().usd):'')+(MODE==='live'&&S.eqAll!=null?' · tradable '+f2(eq,2):''))+k('Total P/L',sg(tot,2),sg(tot/(S.base0||start||1)*100)+'%',tot>=0?'pos':'neg')+(fx()?k('P/L $',usd(tot*fx().usd),xrpf(tot*fx().xrp),tot>=0?'pos':'neg'):'')+k('Open P/L',sg(op,op&&Math.abs(op)<1?3:2),p?(sh?'short':'long'):'flat',op>=0?'pos':'neg')+k('Win rate',m.n?f2(m.wr,0)+'%':'—',m.n+' trades')+k('Regime',E?E.name:'—',E?Math.round(E.conf)+'% conf':'')+k('Volatility',E?f2(E.atrPct,2)+'%':'—',E?'ATR · '+f2(E.vr,2)+'× norm':'');
   $('eqNow').textContent=f2((MODE==='live'&&S.eqAll!=null)?S.eqAll:eq,2)+' '+q;
   {const sc=Math.round(clamp((Math.min(m.pf===Infinity?3:m.pf,3)/3)*40+m.wr*.3+Math.max(0,30-m.mdd*3),0,100)),bh=S.pxStart?(px/S.pxStart-1)*100:null;
    $('kpiStrip').innerHTML+=(S.goal>0?k('Daily goal',sg(S.dayPnlPct||0,2)+'%',S.goalHit?'HIT · stopped':'of +'+S.goal+'%',S.goalHit?'pos':''):k('Today',sg(S.dayPnlPct||0,2)+'%','daily P/L'))+k('Health',m.n<5?'—':sc,'strategy score')+(bh!=null?k('Buy & hold',sg(bh,2)+'%','vs bot '+sg(tot/(S.base0||start||1)*100,2)+'%'):'')}
@@ -1254,7 +1260,7 @@ $('bConfirm').onclick=async()=>{const p=PLAN;if(!p)return;const r=await act(p.si
 $('bClose').onclick=()=>act('sell');$('bBE').onclick=()=>{if(S.pos)act('lines',{stop:S.pos.entry})};
 $('bTgt').onclick=()=>{if(!S.pos)return;if(S.pos.target)return act('lines',{target:null});const sh=S.pos.side==='SHORT',r=Math.abs(S.pos.entry-S.pos.stop)*Math.max(cfg.takeProfitR,1.5);act('lines',{target:sh?S.px-r:S.px+r})};
 $('bPlay').onclick=()=>{playing=!playing;$('bPlay').textContent=playing?'Pause':'Play'};
-$('bHedge').onclick=()=>act('hedge',{on:!S.hedgeOn});$('bAuto').onclick=()=>act('auto',{on:!S.autoOn});$('bShortOn').onclick=()=>act('shorton',{on:!S.shortOn});$('bKill').onclick=()=>act('kill');$('bNever').onclick=()=>act('config',{runForever:!cfg.runForever});$('bResume').onclick=()=>act('resume');
+$('bHedge').onclick=()=>act('hedge',{on:!S.hedgeOn});$('bAuto').onclick=()=>act('auto',{on:!S.autoOn});$('bShortOn').onclick=()=>act('shorton',{on:!S.shortOn});$('bKill').onclick=()=>act('kill');if($('bDlHist'))$('bDlHist').onclick=dlHist;$('bNever').onclick=()=>act('config',{runForever:!cfg.runForever});$('bResume').onclick=()=>act('resume');
 $('bReset').onclick=()=>{sims[S.pair]=newSim(S.pair);S=sims[S.pair];PLAN=null;ALERTS=[];PAN=0;render()};
 $('bLatest').onclick=()=>{PAN=0;drawChart()};$('zoom').oninput=e=>{VIS=+e.target.value;drawChart()};$('paneSel').onchange=e=>{PANE=e.target.value;drawChart()};
 document.querySelectorAll('.seg').forEach(b=>b.onclick=()=>{scenario=b.dataset.sc;document.querySelectorAll('.seg').forEach(s=>s.classList.toggle('on',s===b));if(S)S.regLeft=0});

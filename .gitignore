@@ -1,8 +1,10 @@
+*.zip
+.env
+STOP
+history.bak.json
+history.json
 node_modules/
+pairs.json
 state.json
 state.json.tmp
 trades.csv
-pairs.json
-STOP
-*.zip
-.env

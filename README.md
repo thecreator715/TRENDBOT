@@ -21,3 +21,6 @@ With a wallet connected the bot trades **real funds** on mainnet. The seed is ke
 - Nothing here guarantees profit or prevents losses. Stops are polled, not on-ledger; gaps and thin books slip past them.
 - Not yet in the live bot (simulator-only): hedge (long+short), Smart Auto regime gating, reversed pairs.
 - Start with a small wallet. Run `node test.js` after any change.
+
+## Your analytics are permanent
+Trades and the equity history are saved in history.json (with history.bak.json as a rolling backup) next to bot.js. Restarts, Resume and deleting state.json do not erase them. When updating, copy the new files over the old folder and keep history.json. Do not delete it unless you want to start the analytics from zero.

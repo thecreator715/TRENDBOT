@@ -36,6 +36,20 @@ const pairById = id => pairs.find(p => p.id === id);
 // ---------- state ----------
 let wallet = null, client = null, busy = false;
 let state = (() => { try { return JSON.parse(fs.readFileSync(F('state.json'), 'utf8')); } catch { return {}; } })();
+// ---- permanent analytics store: history.json (+ rolling backup). Never reset by Resume, restarts, or deleting state.json ----
+let hist = (() => { for (const f of ['history.json', 'history.bak.json']) { try { const h = JSON.parse(fs.readFileSync(F(f), 'utf8')); if (h && Array.isArray(h.trades)) return h; } catch {} } return {}; })();
+hist.trades ||= []; hist.eq ||= []; hist.base ||= {}; hist.since ||= Date.now();
+state.trades ||= [];
+{ const kT = t => `${t.t}|${t.pair}|${t.side}|${t.entry}`, seen = new Set(state.trades.map(kT)); for (const t of hist.trades) if (!seen.has(kT(t))) state.trades.push(t); state.trades.sort((a, b) => a.t - b.t); hist.trades = state.trades.slice(); }
+let histAt = 0, bakAt = 0;
+function saveHist(force) {
+  if (!force && Date.now() - histAt < 20000) return; histAt = Date.now();
+  try {
+    if (hist.eq.length > 30000) hist.eq = hist.eq.filter((_, i) => i % 2 === 0 || i > 15000);
+    if (Date.now() - bakAt > 600000 && fs.existsSync(F('history.json'))) { fs.copyFileSync(F('history.json'), F('history.bak.json')); bakAt = Date.now(); }
+    fs.writeFileSync(F('history.json') + '.tmp', JSON.stringify(hist)); fs.renameSync(F('history.json') + '.tmp', F('history.json'));
+  } catch (e) { log('history save failed:', e.message); }
+}
 state.pairId ||= 'XRP/RLUSD'; state.autoOn ??= true; state.shortOn ??= !!cfg.autoShort; state.pairs ||= {}; state.trades ||= [];
 let pair = pairById(state.pairId) || pairs[0];
 let P, candles; // per-pair runtime
@@ -255,6 +269,7 @@ function recordExit(rBase, rQuote, rPrice, reason) {
   if (pnl < 0 && /stop/.test(reason)) P.lastStop = { t: Date.now(), long: !short };
   pos.cost -= pos.cost * portion; pos.base -= rBase;
   state.trades.push({ t: Date.now(), pair: pair.id, side: short ? 'SHORT' : 'LONG', entry: pos.entry, exit: rPrice, pnl: +pnl.toFixed(6), r: pos.risk ? +(pnl / (pos.risk * portion)).toFixed(3) : null, reason, bars: pos.t0 ? Math.max(0, Math.round((Date.now() - pos.t0) / candles.tf)) : 0 }); if (state.trades.length > 500) state.trades.shift();
+  hist.trades.push(state.trades[state.trades.length - 1]); saveHist(true);
   (P.marks ||= []).push({ t: candles.cur.t, price: rPrice, kind: short ? 'cover' : 'sell' });
   logTrade([new Date().toISOString(), pair.id, short ? 'COVER' : 'SELL', wallet ? 'live' : 'paper', reason, rBase.toFixed(6), rQuote.toFixed(6), rPrice.toPrecision(8), pnl.toFixed(6)]);
   addLog(pnl < 0 ? 'loss' : 'sell', `${short ? 'COVER' : 'SELL'} ${rBase.toFixed(2)} @ ${rPrice.toPrecision(6)} · ${reason} · ${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)} ${sym(pair.quote.currency)}`);
@@ -402,10 +417,13 @@ async function tick() {
     // external deposit/withdrawal (not a trade): shift the day's baseline by the flow so it is not read as a trading gain or loss
     if (wallet && prevB && !prevB.busy && !(P.pos || P.pend) && prevB.tr === state.trades.length && prevB.pid === pair.id) {
       const flow = (b.quote - prevB.b.quote) + (b.base - prevB.b.base) * px;
-      if (Math.abs(flow) > Math.max(cfg.minTradeQuote, 0.01 * Math.max(e, 1e-9))) { startEq += flow; runStartEq += flow; if (startEq < 0) startEq = 0; if (runStartEq < 0) runStartEq = 0; addLog('info', `Deposit/withdrawal detected: ${flow >= 0 ? '+' : ''}${flow.toFixed(4)} ${sym(pair.quote.currency)}. Baseline adjusted, P/L unchanged.`); }
+      if (Math.abs(flow) > Math.max(cfg.minTradeQuote, 0.01 * Math.max(e, 1e-9))) { startEq += flow; runStartEq += flow; if (hist.base[pair.id]) hist.base[pair.id].eq += flow; if (startEq < 0) startEq = 0; if (runStartEq < 0) runStartEq = 0; addLog('info', `Deposit/withdrawal detected: ${flow >= 0 ? '+' : ''}${flow.toFixed(4)} ${sym(pair.quote.currency)}. Baseline adjusted, P/L unchanged.`); }
     }
     prevB = { b: { ...b }, busy: !!(P.pos || P.pend), tr: state.trades.length, pid: pair.id };
-    if (walC) { const tot = a => isXRP(a) ? walC.xrp : ((walC.lines.find(x => x.raw === a.currency && x.issuer === a.issuer) || {}).balance || 0); last.eqAll = tot(pair.quote) + tot(pair.base) * px; last.xrpTotal = walC.xrp; }
+    if (walC) { const tot = a => isXRP(a) ? walC.xrp : ((walC.lines.find(x => x.raw === a.currency && x.issuer === a.issuer) || {}).balance || 0); last.eqAll = tot(pair.quote) + tot(pair.base) * px; last.xrpTotal = walC.xrp;
+      const ev = last.eqAll;
+      if (ev > 0 && !hist.base[pair.id]) hist.base[pair.id] = { t: Date.now(), eq: ev };
+      if (!hist.lastEqT || Date.now() - hist.lastEqT >= 30000) { hist.lastEqT = Date.now(); hist.eq.push([Date.now(), +ev.toFixed(6), pair.id]); saveHist(); } }
     const dk = new Date().toISOString().slice(0, 10);
     if (dk !== dayKey) { dayKey = dk; startEq = e; P.tradesToday = 0; P.dayPnl = 0; P.goalHit = false; if (state.halted && /daily goal/.test(state.halted)) state.halted = null; }
     eq.push(e); if (eq.length > 600) eq.shift();
@@ -488,11 +506,11 @@ const view = () => {
   const cs = candles.closed.slice(-200);
   const frac = candles.cur ? Math.min(1, (Date.now() - candles.cur.t) / candles.tf) : 0;
   return {
-    ver: 2.8, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
+    ver: 2.9, plan: last.plan || null, pend: P.pend ? { long: P.pend.long, price: P.pend.price, base: P.pend.base, age: Math.round((Date.now() - P.pend.t0) / 1000) } : null, offers: offC.map(o => ({ ...o, bot: P.pend && o.seq === P.pend.seq ? 'entry' : P.pos && P.pos.tp && o.seq === P.pos.tp.seq ? 'take-profit' : null })), fx: last.fx || null, dayPct: last.tp ?? null, dexN: last.dexN || 0, ledger: last.ledger || null, server: last.server || null, src: last.src || null, ref: last.ref || null, refDev: (last.ref && last.px && pair.id.startsWith('XRP/')) ? (last.px / last.ref - 1) * 100 : null, dexErr: last.dexErr || null, ask: last.ask || null, bid: last.bid || null, tickAt: last.at || null, nTicks: P.ticks.length, live: !!wallet, address: wallet ? wallet.address : null, mock: MOCK, pair: pair.id, pairs: pairs.map(p => p.id),
     quoteSym: sym(pair.quote.currency), baseSym: sym(pair.base.currency),
     px: last.px, cs, cur: candles.cur, cinfo: `${cfg.timeframeMinutes}m candles · ${candles.closed.length} closed · ${Math.round(frac * 100)}%`,
     pos: P.pos, sig: last.sig, halted: state.halted || null, autoOn: state.autoOn, shortOn: state.shortOn, err: last.err,
-    use: P.use ?? 100, goal: P.goal || 0, goalHit: !!P.goalHit, trades: state.trades.filter(t => !t.pair || t.pair === pair.id).slice(-300), marks: (P.marks || []).slice(-120), eq, start: startEq, logs, cfg: { ...S.DEFAULTS, ...cfg }, consec: P.consec, bal: balC, orphans: Math.max(0, offC.length - (P.pend ? 1 : 0) - (P.pos && P.pos.tp ? 1 : 0)), eqAll: last.eqAll ?? null, wal: walC ? { ...walC, at: walAt } : null, wtx: walTxC, noTrust: last.noTrust || null, eqNow: last.eq ?? null, note: last.note || null,
+    use: P.use ?? 100, goal: P.goal || 0, goalHit: !!P.goalHit, trades: state.trades.filter(t => !t.pair || t.pair === pair.id).slice(-5000), base0: (hist.base[pair.id] || {}).eq ?? null, histSince: hist.since, histEq: hist.eq.filter(p => p[2] === pair.id).slice(-3000).map(p => [p[0], p[1]]), nTradesAll: state.trades.length, marks: (P.marks || []).slice(-120), eq, start: startEq, logs, cfg: { ...S.DEFAULTS, ...cfg }, consec: P.consec, bal: balC, orphans: Math.max(0, offC.length - (P.pend ? 1 : 0) - (P.pos && P.pos.tp ? 1 : 0)), eqAll: last.eqAll ?? null, wal: walC ? { ...walC, at: walAt } : null, wtx: walTxC, noTrust: last.noTrust || null, eqNow: last.eq ?? null, note: last.note || null,
   };
 };
 const body = req => new Promise((res, rej) => { let d = ''; req.on('data', c => { d += c; if (d.length > 20000) { rej(new Error('too large')); req.destroy(); } }); req.on('end', () => { try { res(d ? JSON.parse(d) : {}); } catch (e) { rej(e); } }); });
