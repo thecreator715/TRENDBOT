@@ -19,7 +19,7 @@ With a wallet connected the bot trades **real funds** on mainnet. The seed is ke
 
 ## Honest limits
 - Nothing here guarantees profit or prevents losses. Stops are polled, not on-ledger; gaps and thin books slip past them.
-- Not yet in the live bot (simulator-only): hedge (long+short), Smart Auto regime gating, reversed pairs.
+- Not yet in the live bot (simulator-only): hedge (long+short), reversed pairs. Smart Auto is live in v3.0.
 - Start with a small wallet. Run `node test.js` after any change.
 
 ## Your analytics are permanent
